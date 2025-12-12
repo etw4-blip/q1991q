@@ -31,6 +31,8 @@ jobs:
 
       - name: Configure RDP
         run: |
+          Write-Host "Configuring RDP..."
+          
           # Enable Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                            -Name "fDenyTSConnections" -Value 0 -Force
@@ -50,13 +52,13 @@ jobs:
           # Restart RDP service
           Restart-Service -Name TermService -Force
           
-          Write-Host "RDP configured successfully"
+          Write-Host "✅ RDP configured successfully"
 
       - name: Create RDP User
         run: |
           Write-Host "Creating RDP user account..."
           
-          # Generate secure password using PowerShell (不依赖System.Web)
+          # Generate secure password using PowerShell
           $charSets = @{
               Lowercase = 'abcdefghijklmnopqrstuvwxyz'.ToCharArray()
               Uppercase = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.ToCharArray()
@@ -103,81 +105,170 @@ jobs:
           # Store credentials
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           
-          Write-Host "User created: $env:RDP_USERNAME"
+          Write-Host "✅ User created: $env:RDP_USERNAME"
 
-      - name: Install Tailscale
+      - name: Install Tailscale (Fixed)
+        id: install_tailscale
         run: |
           Write-Host "Installing Tailscale v$env:TAILSCALE_VERSION..."
           
+          # 下载Tailscale安装程序
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$env:TAILSCALE_VERSION-amd64.msi"
           $installerPath = "$env:TEMP ailscale.msi"
           
+          Write-Host "Downloading from: $tsUrl"
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
           
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          # 安装Tailscale
+          Write-Host "Installing Tailscale..."
+          $installArgs = @(
+            "/i",
+            "`"$installerPath`"",
+            "/quiet",
+            "/norestart",
+            "/log",
+            "$env:TEMP ailscale_install.log"
+          )
           
-          Remove-Item $installerPath -Force
+          $process = Start-Process msiexec.exe -ArgumentList $installArgs -Wait -NoNewWindow -PassThru
           
-          Write-Host "Tailscale installed successfully"
+          if ($process.ExitCode -ne 0) {
+              Write-Host "Installation log content:"
+              Get-Content "$env:TEMP ailscale_install.log" -ErrorAction SilentlyContinue | Select-Object -Last 20
+              Write-Error "Tailscale installation failed with exit code: $($process.ExitCode)"
+              exit 1
+          }
           
-          # 验证安装
-          if (Test-Path "$env:ProgramFiles\Tailscale ailscale.exe") {
-              Write-Host "Tailscale executable found at: $env:ProgramFiles\Tailscale ailscale.exe"
+          # 清理安装文件
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+          
+          # 等待安装完成并刷新环境
+          Write-Host "Waiting for installation to complete..."
+          Start-Sleep -Seconds 10
+          
+          # 刷新环境变量
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+          
+          Write-Host "✅ Tailscale installation process completed"
+
+      - name: Verify Tailscale Installation
+        run: |
+          Write-Host "Verifying Tailscale installation..."
+          
+          # 检查多个可能的安装路径
+          $possiblePaths = @(
+              "$env:ProgramFiles\Tailscale ailscale.exe",
+              "${env:ProgramFiles(x86)}\Tailscale ailscale.exe",
+              "C:\Program Files\Tailscale ailscale.exe",
+              "C:\Program Files (x86)\Tailscale ailscale.exe"
+          )
+          
+          $tailscalePath = $null
+          foreach ($path in $possiblePaths) {
+              if (Test-Path $path) {
+                  $tailscalePath = $path
+                  Write-Host "Found Tailscale at: $path"
+                  break
+              }
+          }
+          
+          if (-not $tailscalePath) {
+              # 尝试在系统中搜索
+              Write-Host "Searching for tailscale.exe in system..."
+              $searchResult = Get-ChildItem -Path "C:\" -Recurse -Filter "tailscale.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($searchResult) {
+                  $tailscalePath = $searchResult.FullName
+                  Write-Host "Found via search: $tailscalePath"
+              }
+          }
+          
+          if ($tailscalePath) {
+              # 测试Tailscale是否可执行
+              Write-Host "Testing Tailscale executable..."
+              $version = & $tailscalePath version
+              Write-Host "Tailscale version: $version"
+              
+              echo "TAILSCALE_PATH=$tailscalePath" >> $env:GITHUB_ENV
+              Write-Host "✅ Tailscale verified successfully"
           } else {
-              Write-Error "Tailscale executable not found"
+              Write-Error "❌ Tailscale executable not found after installation"
+              Write-Host "Checking installed programs..."
+              Get-WmiObject -Class Win32_Product | Where-Object {$_.Name -like "*Tailscale*"} | Format-List Name, Version, InstallLocation
               exit 1
           }
 
-      - name: Connect Tailscale
+      - name: Connect to Tailscale
         run: |
-          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
-          Write-Host "Connecting to Tailscale as: $hostname"
+          Write-Host "Connecting to Tailscale..."
           
-          # 检查Tailscale路径
-          $tailscalePath = "$env:ProgramFiles\Tailscale ailscale.exe"
-          if (-not (Test-Path $tailscalePath)) {
-              Write-Error "Tailscale not found at: $tailscalePath"
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          Write-Host "Hostname: $hostname"
+          
+          $tailscalePath = $env:TAILSCALE_PATH
+          
+          if (-not $tailscalePath) {
+              Write-Error "Tailscale path not set"
               exit 1
           }
           
-          Write-Host "Using Tailscale from: $tailscalePath"
-          
           # 连接Tailscale
+          Write-Host "Running: $tailscalePath up --authkey=*** --hostname=$hostname"
           & $tailscalePath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
           
-          # Wait for IP
+          # 等待IP分配
+          Write-Host "Waiting for Tailscale IP assignment..."
           $tsIP = $null
-          for ($i=1; $i -le 30; $i++) {
+          $maxAttempts = 30
+          
+          for ($i = 1; $i -le $maxAttempts; $i++) {
               $tsIP = & $tailscalePath ip -4 2>$null
-              if ($tsIP) { 
-                  Write-Host "Tailscale IP obtained: $tsIP"
-                  break 
+              if ($tsIP -and $tsIP.Trim() -ne "") {
+                  Write-Host "✅ Tailscale IP obtained: $tsIP"
+                  break
               }
-              Write-Host "Attempt $i/30: Waiting for IP..."
+              Write-Host "Attempt $i/$maxAttempts: Waiting for IP..."
               Start-Sleep -Seconds 2
           }
           
           if (-not $tsIP) {
-              Write-Error "Failed to get Tailscale IP after 30 attempts"
+              Write-Error "❌ Failed to get Tailscale IP after $maxAttempts attempts"
+              Write-Host "Tailscale status:"
               & $tailscalePath status
               exit 1
           }
           
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "✅ Connected to Tailscale with IP: $tsIP"
 
       - name: Test RDP Connection
         run: |
-          Write-Host "Testing connection to $env:TAILSCALE_IP..."
+          Write-Host "Testing RDP connection to $env:TAILSCALE_IP..."
           
-          Start-Sleep -Seconds 5
+          # 给服务一些时间启动
+          Start-Sleep -Seconds 10
           
-          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
-          if (-not $test) {
-              Write-Error "RDP connection failed"
-              exit 1
+          # 测试连接
+          $success = $false
+          for ($i = 1; $i -le 3; $i++) {
+              Write-Host "Connection test attempt $i of 3..."
+              $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet -WarningAction SilentlyContinue
+              if ($test) {
+                  $success = $true
+                  break
+              }
+              Start-Sleep -Seconds 5
           }
           
-          Write-Host "Connection successful!"
+          if ($success) {
+              Write-Host "✅ RDP connection successful!"
+          } else {
+              Write-Error "❌ RDP connection test failed after 3 attempts"
+              Write-Host "Checking RDP service status..."
+              Get-Service TermService, SessionEnv | Format-Table Name, Status, StartType
+              Write-Host "Checking firewall rules..."
+              Get-NetFirewallRule -Name "*RDP*" | Format-Table Name, Enabled, Action
+              exit 1
+          }
 
       - name: Display Connection Info
         run: |
@@ -213,8 +304,8 @@ jobs:
           $timeout = [int]${{ inputs.session_timeout }}
           $endTime = $startTime.AddMinutes($timeout)
           
-          Write-Host "Session timer started at: $startTime"
-          Write-Host "Will auto-terminate at: $endTime"
+          Write-Host "⏳ Session timer started at: $startTime"
+          Write-Host " Will auto-terminate at: $endTime"
           Write-Host ""
           
           while ($true) {
@@ -222,7 +313,7 @@ jobs:
               $remaining = $endTime - $now
               
               if ($remaining.TotalSeconds -le 0) {
-                  Write-Host "Session timeout reached"
+                  Write-Host "⏰ Session timeout reached"
                   break
               }
               
@@ -231,7 +322,16 @@ jobs:
                   Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Active - $minutesLeft minutes remaining"
               }
               
+              # 定期检查服务状态
+              if ([math]::Floor(($now - $startTime).TotalSeconds) % 60 -eq 0) {
+                  $service = Get-Service TermService -ErrorAction SilentlyContinue
+                  if ($service.Status -ne 'Running') {
+                      Write-Host "⚠️ RDP service not running, restarting..."
+                      Start-Service TermService -ErrorAction SilentlyContinue
+                  }
+              }
+              
               Start-Sleep -Seconds 1
           }
           
-          Write-Host "Session ended"
+          Write-Host "🛑 Session ended"
