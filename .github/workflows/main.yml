@@ -1,4 +1,4 @@
-name: Windows RDP Setup (Simplified)
+name: Windows RDP Setup with Visible Password
 
 on:
   workflow_dispatch:
@@ -60,8 +60,8 @@ jobs:
           $randomDigits = Get-Random -Minimum 1000 -Maximum 9999
           $password = "GitHubRDP$randomDigits"
           
-          # Mask password in logs
-          Write-Host "::add-mask::$password"
+          # 注意：这里我们不使用 add-mask，这样密码会显示
+          # Write-Host "::add-mask::$password" <-- 这行注释掉或删除
           
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           
@@ -78,10 +78,11 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
           
-          # Store credentials for later steps
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          # 将密码写入文件，而不是使用环境变量（避免被GitHub屏蔽）
+          $password | Out-File -FilePath "$env:RUNNER_TEMP dp_password.txt" -NoNewline
           
           Write-Host "✅ User '$env:RDP_USERNAME' configured"
+          Write-Host "🔓 Password has been generated and saved"
 
       - name: Get Network Information
         run: |
@@ -110,173 +111,8 @@ jobs:
           echo "LOCAL_IP=$localIP" >> $env:GITHUB_ENV
           Write-Host "🔗 Local IP: $localIP"
 
-      - name: Test RDP Port
-        run: |
-          Write-Host "🧪 Testing RDP port 3389..."
-          
-          Start-Sleep -Seconds 5
-          
-          $portTest = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -InformationLevel Quiet
-          
-          if ($portTest) {
-              Write-Host "✅ RDP port 3389 is open and listening"
-          } else {
-              Write-Host "⚠️ RDP port test failed locally, but may work externally"
-          }
-
-      - name: Generate Connection Summary
-        run: |
-          Write-Host "📋 Generating connection summary..."
-          
-          # Create a summary file
-          $summary = @"
-===========================================
-WINDOWS RDP CONNECTION INFORMATION
-===========================================
-
-CREDENTIALS:
-  Username: $env:RDP_USERNAME
-  Password: $env:RDP_PASSWORD
-
-CONNECTION ADDRESSES:
-  1. Public IP (if available): $env:PUBLIC_IP
-  2. Local IP: $env:LOCAL_IP
-
-CONNECTION INSTRUCTIONS:
-  1. Open Remote Desktop Connection (mstsc.exe)
-  2. Enter one of the IP addresses above
-  3. Use the username and password shown above
-
-QUICK CONNECT COMMANDS:
-  Windows: mstsc /v:$env:PUBLIC_IP
-  Windows (alt): mstsc /v:$env:LOCAL_IP
-
-SESSION INFORMATION:
-  Workflow ID: $env:GITHUB_RUN_ID
-  Session Timeout: ${{ inputs.session_timeout }} minutes
-  Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-  Will End: $(Get-Date).AddMinutes(${{ inputs.session_timeout }})
-
-NOTES:
-  • If public IP doesn't work, try the local IP
-  • Session will auto-terminate after ${{ inputs.session_timeout }} minutes
-  • To end session early, click "Cancel workflow" in GitHub Actions
-  • This is a temporary session - data may not persist
-
-===========================================
-"@
-          
-          # Save to file
-          $summary | Out-File -FilePath "$env:RUNNER_TEMP dp_connection.txt"
-          
-          # Also save to environment for display in next step
-          echo "CONNECTION_SUMMARY<<EOF" >> $env:GITHUB_ENV
-          echo "$summary" >> $env:GITHUB_ENV
-          echo "EOF" >> $env:GITHUB_ENV
-          
-          Write-Host "✅ Summary generated"
-
-      - name: Display Connection Details (VERY IMPORTANT)
+      - name: Display Connection Details (Password Will Be Visible)
         run: |
           Write-Host ""
-          Write-Host "🚨🚨🚨 IMPORTANT: SAVE THIS INFORMATION 🚨🚨🚨"
+          Write-Host "🚨🚨🚨 IMPORTANT: COPY THIS INFORMATION NOW 🚨🚨🚨"
           Write-Host "==================================================="
-          Write-Host ""
-          
-          # Display credentials clearly
-          Write-Host "🔐 CREDENTIALS:"
-          Write-Host " USERNAME: $env:RDP_USERNAME"
-          Write-Host " PASSWORD: $env:RDP_PASSWORD"
-          Write-Host ""
-          
-          # Display connection addresses
-          Write-Host "📍 CONNECTION ADDRESSES:"
-          if ($env:PUBLIC_IP -ne "unknown") {
-              Write-Host " 1. Public IP: $env:PUBLIC_IP"
-          }
-          Write-Host " 2. Local IP: $env:LOCAL_IP"
-          Write-Host ""
-          
-          # Quick commands
-          Write-Host "💻 QUICK CONNECT:"
-          if ($env:PUBLIC_IP -ne "unknown") {
-              Write-Host " mstsc /v:$env:PUBLIC_IP"
-          }
-          Write-Host " mstsc /v:$env:LOCAL_IP"
-          Write-Host ""
-          
-          # Session info
-          Write-Host "⏰ SESSION INFO:"
-          Write-Host " Timeout: ${{ inputs.session_timeout }} minutes"
-          Write-Host " Workflow ID: $env:GITHUB_RUN_ID"
-          Write-Host ""
-          
-          Write-Host "📝 NOTES:"
-          Write-Host " • Copy this information NOW - it won't be shown again!"
-          Write-Host " • The summary is also saved to a file"
-          Write-Host ""
-          
-          Write-Host "==================================================="
-          Write-Host "🚨🚨🚨 SAVE THE ABOVE INFORMATION 🚨🚨🚨"
-          Write-Host ""
-          
-          # Also output the full summary
-          Write-Host "Full connection summary saved to:"
-          Write-Host "$env:RUNNER_TEMP dp_connection.txt"
-          Write-Host ""
-          
-          # Display the file content
-          Write-Host "File content:"
-          Get-Content "$env:RUNNER_TEMP dp_connection.txt"
-
-      - name: Upload Connection Details as Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rdp-connection-info
-          path: ${{ runner.temp }}/rdp_connection.txt
-          retention-days: 1
-
-      - name: Keep Session Active
-        run: |
-          $startTime = Get-Date
-          $timeout = [int]${{ inputs.session_timeout }}
-          $endTime = $startTime.AddMinutes($timeout)
-          
-          Write-Host ""
-          Write-Host "⏳ RDP Session Active"
-          Write-Host " Started: $startTime"
-          Write-Host " Will end: $endTime"
-          Write-Host ""
-          Write-Host "📋 Connection Information (also saved as artifact):"
-          Write-Host " Username: $env:RDP_USERNAME"
-          Write-Host " Password: $env:RDP_PASSWORD"
-          
-          if ($env:PUBLIC_IP -ne "unknown") {
-              Write-Host " Public IP: $env:PUBLIC_IP"
-          }
-          Write-Host " Local IP: $env:LOCAL_IP"
-          Write-Host ""
-          Write-Host "🔧 To connect: Open Remote Desktop (mstsc.exe) and enter IP"
-          Write-Host "❌ To end session: Click 'Cancel workflow' in GitHub Actions"
-          Write-Host ""
-          
-          # Heartbeat loop
-          while ($true) {
-              $now = Get-Date
-              $remaining = $endTime - $now
-              
-              if ($remaining.TotalSeconds -le 0) {
-                  Write-Host "⏰ Session timeout reached"
-                  break
-              }
-              
-              # Display remaining time every 30 seconds
-              if ([math]::Floor(($now - $startTime).TotalSeconds) % 30 -eq 0) {
-                  $minutesLeft = [math]::Round($remaining.TotalMinutes, 1)
-                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Active - $minutesLeft minutes remaining"
-              }
-              
-              Start-Sleep -Seconds 1
-          }
-          
-          Write-Host "🛑 Session ended at $(Get-Date)"
