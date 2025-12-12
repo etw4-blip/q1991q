@@ -119,18 +119,36 @@ jobs:
           Remove-Item $installerPath -Force
           
           Write-Host "Tailscale installed successfully"
+          
+          # 验证安装
+          if (Test-Path "$env:ProgramFiles\Tailscale ailscale.exe") {
+              Write-Host "Tailscale executable found at: $env:ProgramFiles\Tailscale ailscale.exe"
+          } else {
+              Write-Error "Tailscale executable not found"
+              exit 1
+          }
 
       - name: Connect Tailscale
         run: |
           $hostname = "gh-runner-$env:GITHUB_RUN_ID"
           Write-Host "Connecting to Tailscale as: $hostname"
           
-          & "$env:ProgramFiles\Tailscale ailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
+          # 检查Tailscale路径
+          $tailscalePath = "$env:ProgramFiles\Tailscale ailscale.exe"
+          if (-not (Test-Path $tailscalePath)) {
+              Write-Error "Tailscale not found at: $tailscalePath"
+              exit 1
+          }
+          
+          Write-Host "Using Tailscale from: $tailscalePath"
+          
+          # 连接Tailscale
+          & $tailscalePath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
           
           # Wait for IP
           $tsIP = $null
           for ($i=1; $i -le 30; $i++) {
-              $tsIP = & "$env:ProgramFiles\Tailscale ailscale.exe" ip -4 2>$null
+              $tsIP = & $tailscalePath ip -4 2>$null
               if ($tsIP) { 
                   Write-Host "Tailscale IP obtained: $tsIP"
                   break 
@@ -141,7 +159,7 @@ jobs:
           
           if (-not $tsIP) {
               Write-Error "Failed to get Tailscale IP after 30 attempts"
-              & "$env:ProgramFiles\Tailscale ailscale.exe" status
+              & $tailscalePath status
               exit 1
           }
           
