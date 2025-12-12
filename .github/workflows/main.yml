@@ -1,327 +1,266 @@
-name: Secure Windows RDP via Tailscale
+name: Windows RDP Setup (Simplified)
 
 on:
   workflow_dispatch:
     inputs:
       session_timeout:
-        description: 'Session timeout in minutes (10-360)'
+        description: 'Session duration in minutes (10-360)'
         required: false
-        default: '120'
+        default: '60'
         type: string
 
 env:
-  RDP_USERNAME: 'RDP-Admin'
+  RDP_USERNAME: 'GitHubRDPUser'
 
 jobs:
-  secure-rdp-session:
+  setup-rdp:
     runs-on: windows-latest
     timeout-minutes: ${{ fromJSON(inputs.session_timeout) }}
 
     steps:
-      - name: Check Session Timeout
+      - name: Display Start Information
         run: |
-          $timeout = [int]${{ inputs.session_timeout }}
-          if ($timeout -lt 10 -or $timeout -gt 360) {
-            Write-Error "Timeout must be between 10 and 360 minutes"
-            Write-Output "::error::Session timeout must be between 10 and 360 minutes"
-            exit 1
-          }
-          Write-Host "✅ Session will timeout after $timeout minutes"
+          Write-Host "🚀 Starting Windows RDP Setup..."
+          Write-Host "Workflow ID: $env:GITHUB_RUN_ID"
+          Write-Host "Run Number: $env:GITHUB_RUN_NUMBER"
+          Write-Host "Runner OS: $env:RUNNER_OS"
 
-      - name: Configure Windows RDP
+      - name: Enable Remote Desktop
         run: |
-          Write-Host "🔧 Configuring Windows RDP..."
+          Write-Host "🔧 Enabling Remote Desktop..."
           
-          # Enable Remote Desktop
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
           
-          # Set security level
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 1 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+          # Configure security (less secure but more compatible)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 0 -Force
           
           # Configure firewall
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Write-Host "Configuring Windows Firewall..."
+          netsh advfirewall firewall delete rule name="GitHub-RDP" 2>$null
+          netsh advfirewall firewall add rule `
+            name="GitHub-RDP" `
+            dir=in action=allow protocol=TCP localport=3389 `
+            description="RDP access for GitHub Actions"
           
           # Restart RDP service
           Restart-Service -Name TermService -Force
           
-          Write-Host "✅ RDP configured successfully"
+          Write-Host "✅ Remote Desktop enabled"
 
-      - name: Create RDP User Account
+      - name: Create RDP User with Simple Password
         run: |
-          Write-Host "👤 Creating RDP user account..."
+          Write-Host "👤 Creating RDP user..."
           
-          # Simple password generation
-          $password = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 16 | ForEach-Object {[char]$_})
-          
-          # Add some special characters
-          $specialChars = @('!','@','#','$','%','^','&','*','_','+','-','=')
-          $password = $password.Insert(4, ($specialChars | Get-Random))
-          $password = $password.Insert(8, ($specialChars | Get-Random))
+          # Simple password: GitHubRDP + random 4 digits
+          $randomDigits = Get-Random -Minimum 1000 -Maximum 9999
+          $password = "GitHubRDP$randomDigits"
           
           # Mask password in logs
           Write-Host "::add-mask::$password"
           
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           
-          # Create or update user
+          # Create user (or update if exists)
           try {
               New-LocalUser -Name $env:RDP_USERNAME -Password $securePass -AccountNeverExpires
-              Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME
-              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME
+              Write-Host "✅ New user created"
           } catch {
-              # User might already exist, try to update password
+              Write-Host "⚠️ User exists, updating password..."
               Set-LocalUser -Name $env:RDP_USERNAME -Password $securePass
           }
           
-          # Store credentials
+          # Add to required groups
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          
+          # Store credentials for later steps
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           
-          Write-Host "✅ User account configured: $env:RDP_USERNAME"
-
-      - name: Install Tailscale with Winget
-        run: |
-          Write-Host "📦 Installing Tailscale using Winget..."
-          
-          # Check if winget is available
-          $wingetCheck = Get-Command winget -ErrorAction SilentlyContinue
-          if ($wingetCheck) {
-              Write-Host "✅ Winget is available"
-              
-              # Try to install Tailscale using winget
-              try {
-                  Write-Host "Installing Tailscale via Winget..."
-                  winget install --id Tailscale.Tailscale --silent --accept-package-agreements --accept-source-agreements
-                  Write-Host "✅ Tailscale installed via Winget"
-              } catch {
-                  Write-Host "❌ Winget installation failed: $_"
-                  Write-Host "Trying MSI installation..."
-                  Install-MsiFallback
-              }
-          } else {
-              Write-Host "❌ Winget not available"
-              Write-Host "Using MSI installation..."
-              Install-MsiFallback
-          }
-
-      - name: Verify Tailscale Installation
-        run: |
-          Write-Host "🔍 Verifying Tailscale installation..."
-          
-          # Check for Tailscale executable
-          $possiblePaths = @(
-              "$env:ProgramFiles\Tailscale ailscale.exe",
-              "${env:ProgramFiles(x86)}\Tailscale ailscale.exe",
-              "C:\Program Files\Tailscale ailscale.exe"
-          )
-          
-          $tailscaleFound = $false
-          
-          foreach ($path in $possiblePaths) {
-              if (Test-Path $path) {
-                  Write-Host "✅ Found Tailscale at: $path"
-                  echo "TAILSCALE_PATH=$path" >> $env:GITHUB_ENV
-                  $tailscaleFound = $true
-                  break
-              }
-          }
-          
-          if (-not $tailscaleFound) {
-              Write-Host "❌ Tailscale not found in standard locations"
-              Write-Host "Checking installed programs..."
-              
-              # Check via registry
-              $uninstallKeys = @(
-                  "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-                  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
-              )
-              
-              $tailscaleInfo = $null
-              foreach ($key in $uninstallKeys) {
-                  $tailscaleInfo = Get-ItemProperty $key -ErrorAction SilentlyContinue | 
-                      Where-Object { $_.DisplayName -like "*Tailscale*" } | 
-                      Select-Object -First 1
-                  if ($tailscaleInfo) { break }
-              }
-              
-              if ($tailscaleInfo) {
-                  Write-Host "✅ Tailscale is registered in Windows:"
-                  Write-Host " Name: $($tailscaleInfo.DisplayName)"
-                  Write-Host " Version: $($tailscaleInfo.DisplayVersion)"
-                  Write-Host " InstallLocation: $($tailscaleInfo.InstallLocation)"
-                  
-                  # Try to construct path
-                  if ($tailscaleInfo.InstallLocation) {
-                      $possibleExe = Join-Path $tailscaleInfo.InstallLocation "tailscale.exe"
-                      if (Test-Path $possibleExe) {
-                          echo "TAILSCALE_PATH=$possibleExe" >> $env:GITHUB_ENV
-                          $tailscaleFound = $true
-                      }
-                  }
-              }
-              
-              if (-not $tailscaleFound) {
-                  Write-Host "⚠️ Tailscale seems to be installed but executable not found"
-                  Write-Host "Will use default path: C:\Program Files\Tailscale ailscale.exe"
-                  echo "TAILSCALE_PATH=C:\Program Files\Tailscale ailscale.exe" >> $env:GITHUB_ENV
-              }
-          }
-
-      - name: Connect to Tailscale
-        run: |
-          Write-Host "🔗 Connecting to Tailscale..."
-          
-          $hostname = "github-rdp-$env:GITHUB_RUN_ID"
-          Write-Host "Hostname: $hostname"
-          
-          $tailscalePath = $env:TAILSCALE_PATH
-          
-          Write-Host "Using Tailscale path: $tailscalePath"
-          
-          # Try to connect even if path might not exist
-          $maxAttempts = 3
-          
-          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-              Write-Host "Connection attempt $attempt of $maxAttempts..."
-              
-              try {
-                  if (Test-Path $tailscalePath) {
-                      & $tailscalePath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname --accept-routes=false --reset
-                      
-                      # Wait for IP
-                      $tsIP = $null
-                      for ($i = 1; $i -le 10; $i++) {
-                          $tsIP = & $tailscalePath ip -4 2>$null
-                          if ($tsIP -and $tsIP.Trim() -ne "") {
-                              Write-Host "✅ Tailscale IP obtained: $tsIP"
-                              echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-                              break 2 # Break out of both loops
-                          }
-                          Start-Sleep -Seconds 2
-                      }
-                  } else {
-                      Write-Host "⚠️ Tailscale executable not found at $tailscalePath"
-                      
-                      # Try alternative method
-                      Write-Host "Starting Tailscale service..."
-                      Start-Service "Tailscale" -ErrorAction SilentlyContinue
-                      Start-Sleep -Seconds 5
-                      
-                      # Check if service started
-                      $service = Get-Service "Tailscale" -ErrorAction SilentlyContinue
-                      if ($service.Status -eq 'Running') {
-                          Write-Host "✅ Tailscale service is running"
-                          echo "TAILSCALE_IP=service-running" >> $env:GITHUB_ENV
-                          break
-                      }
-                  }
-              } catch {
-                  Write-Host "Attempt $attempt failed: $_"
-                  if ($attempt -eq $maxAttempts) {
-                      Write-Host "❌ All connection attempts failed"
-                      echo "TAILSCALE_IP=connection-failed" >> $env:GITHUB_ENV
-                  }
-              }
-              
-              Start-Sleep -Seconds 5
-          }
+          Write-Host "✅ User '$env:RDP_USERNAME' configured"
 
       - name: Get Network Information
         run: |
-          Write-Host "📊 Getting network information..."
+          Write-Host "🌐 Getting network information..."
           
-          # Get local IP address
-          $localIP = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "Ethernet*" | Where-Object {$_.PrefixOrigin -eq 'Dhcp'} | Select-Object -First 1).IPAddress
-          if (-not $localIP) {
-              $localIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -like "10.*" -or $_.IPAddress -like "192.168.*"} | Select-Object -First 1).IPAddress
-          }
+          # Get all network adapters and their IPs
+          $networkInfo = Get-NetIPAddress -AddressFamily IPv4 | 
+                         Where-Object {$_.IPAddress -ne "127.0.0.1"} |
+                         Select-Object IPAddress, InterfaceAlias
           
-          echo "LOCAL_IP=$localIP" >> $env:GITHUB_ENV
-          Write-Host "🔗 Local IP: $localIP"
+          Write-Host "Network Adapters Found:"
+          $networkInfo | Format-Table -AutoSize
           
           # Try to get public IP
           try {
               $publicIP = (Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10).Trim()
               echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
-              Write-Host "🌐 Public IP: $publicIP"
+              Write-Host "✅ Public IP: $publicIP"
           } catch {
               Write-Host "⚠️ Could not get public IP"
               echo "PUBLIC_IP=unknown" >> $env:GITHUB_ENV
           }
           
-          Write-Host "✅ Network information gathered"
+          # Get a local IP for display
+          $localIP = $networkInfo[0].IPAddress
+          echo "LOCAL_IP=$localIP" >> $env:GITHUB_ENV
+          Write-Host "🔗 Local IP: $localIP"
 
-      - name: Display Connection Information
+      - name: Test RDP Port
+        run: |
+          Write-Host "🧪 Testing RDP port 3389..."
+          
+          Start-Sleep -Seconds 5
+          
+          $portTest = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -InformationLevel Quiet
+          
+          if ($portTest) {
+              Write-Host "✅ RDP port 3389 is open and listening"
+          } else {
+              Write-Host "⚠️ RDP port test failed locally, but may work externally"
+          }
+
+      - name: Generate Connection Summary
+        run: |
+          Write-Host "📋 Generating connection summary..."
+          
+          # Create a summary file
+          $summary = @"
+===========================================
+WINDOWS RDP CONNECTION INFORMATION
+===========================================
+
+CREDENTIALS:
+  Username: $env:RDP_USERNAME
+  Password: $env:RDP_PASSWORD
+
+CONNECTION ADDRESSES:
+  1. Public IP (if available): $env:PUBLIC_IP
+  2. Local IP: $env:LOCAL_IP
+
+CONNECTION INSTRUCTIONS:
+  1. Open Remote Desktop Connection (mstsc.exe)
+  2. Enter one of the IP addresses above
+  3. Use the username and password shown above
+
+QUICK CONNECT COMMANDS:
+  Windows: mstsc /v:$env:PUBLIC_IP
+  Windows (alt): mstsc /v:$env:LOCAL_IP
+
+SESSION INFORMATION:
+  Workflow ID: $env:GITHUB_RUN_ID
+  Session Timeout: ${{ inputs.session_timeout }} minutes
+  Started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+  Will End: $(Get-Date).AddMinutes(${{ inputs.session_timeout }})
+
+NOTES:
+  • If public IP doesn't work, try the local IP
+  • Session will auto-terminate after ${{ inputs.session_timeout }} minutes
+  • To end session early, click "Cancel workflow" in GitHub Actions
+  • This is a temporary session - data may not persist
+
+===========================================
+"@
+          
+          # Save to file
+          $summary | Out-File -FilePath "$env:RUNNER_TEMP dp_connection.txt"
+          
+          # Also save to environment for display in next step
+          echo "CONNECTION_SUMMARY<<EOF" >> $env:GITHUB_ENV
+          echo "$summary" >> $env:GITHUB_ENV
+          echo "EOF" >> $env:GITHUB_ENV
+          
+          Write-Host "✅ Summary generated"
+
+      - name: Display Connection Details (VERY IMPORTANT)
         run: |
           Write-Host ""
-          Write-Host "═" * 60
-          Write-Host "🚀 WINDOWS RDP SESSION READY"
-          Write-Host "═" * 60
+          Write-Host "🚨🚨🚨 IMPORTANT: SAVE THIS INFORMATION 🚨🚨🚨"
+          Write-Host "==================================================="
           Write-Host ""
           
-          Write-Host "👤 Authentication:"
-          Write-Host " Username: $env:RDP_USERNAME"
-          Write-Host " Password: $env:RDP_PASSWORD"
-          
+          # Display credentials clearly
+          Write-Host "🔐 CREDENTIALS:"
+          Write-Host " USERNAME: $env:RDP_USERNAME"
+          Write-Host " PASSWORD: $env:RDP_PASSWORD"
           Write-Host ""
-          Write-Host "🔗 Connection Options:"
           
-          # Option 1: Tailscale
-          if ($env:TAILSCALE_IP -and $env:TAILSCALE_IP -notin @('service-running', 'connection-failed', 'unknown')) {
-              Write-Host " 1. Tailscale (Recommended - Secure):"
-              Write-Host " IP Address: $env:TAILSCALE_IP"
-              Write-Host " Command: mstsc /v:$env:TAILSCALE_IP"
-          } else {
-              Write-Host " 1. Tailscale: Installation or connection issue"
-              Write-Host " Status: $env:TAILSCALE_IP"
+          # Display connection addresses
+          Write-Host "📍 CONNECTION ADDRESSES:"
+          if ($env:PUBLIC_IP -ne "unknown") {
+              Write-Host " 1. Public IP: $env:PUBLIC_IP"
           }
+          Write-Host " 2. Local IP: $env:LOCAL_IP"
+          Write-Host ""
           
-          # Option 2: Public IP
-          if ($env:PUBLIC_IP -and $env:PUBLIC_IP -ne 'unknown') {
-              Write-Host ""
-              Write-Host " 2. Public IP (Less Secure - Firewall open on port 3389):"
-              Write-Host " IP Address: $env:PUBLIC_IP"
-              Write-Host " Command: mstsc /v:$env:PUBLIC_IP"
-              Write-Host " Warning: Ensure your firewall is properly configured!"
+          # Quick commands
+          Write-Host "💻 QUICK CONNECT:"
+          if ($env:PUBLIC_IP -ne "unknown") {
+              Write-Host " mstsc /v:$env:PUBLIC_IP"
           }
-          
-          # Option 3: Local IP
-          if ($env:LOCAL_IP) {
-              Write-Host ""
-              Write-Host " 3. Local Network (If in same network):"
-              Write-Host " IP Address: $env:LOCAL_IP"
-              Write-Host " Command: mstsc /v:$env:LOCAL_IP"
-          }
-          
+          Write-Host " mstsc /v:$env:LOCAL_IP"
           Write-Host ""
-          Write-Host "⏰ Session Information:"
-          Write-Host " Session will end in: ${{ inputs.session_timeout }} minutes"
-          Write-Host " Started: $(Get-Date)"
-          Write-Host " Ends: $(Get-Date).AddMinutes(${{ inputs.session_timeout }})"
           
+          # Session info
+          Write-Host "⏰ SESSION INFO:"
+          Write-Host " Timeout: ${{ inputs.session_timeout }} minutes"
+          Write-Host " Workflow ID: $env:GITHUB_RUN_ID"
           Write-Host ""
-          Write-Host "📋 Notes:"
-          Write-Host " • For Tailscale connection: Install Tailscale client on your machine"
-          Write-Host " • Click 'Cancel workflow' in GitHub Actions to end session early"
-          Write-Host " • Password is randomly generated for this session only"
           
+          Write-Host "📝 NOTES:"
+          Write-Host " • Copy this information NOW - it won't be shown again!"
+          Write-Host " • The summary is also saved to a file"
           Write-Host ""
-          Write-Host "═" * 60
+          
+          Write-Host "==================================================="
+          Write-Host "🚨🚨🚨 SAVE THE ABOVE INFORMATION 🚨🚨🚨"
           Write-Host ""
+          
+          # Also output the full summary
+          Write-Host "Full connection summary saved to:"
+          Write-Host "$env:RUNNER_TEMP dp_connection.txt"
+          Write-Host ""
+          
+          # Display the file content
+          Write-Host "File content:"
+          Get-Content "$env:RUNNER_TEMP dp_connection.txt"
 
-      - name: Keep Session Alive
+      - name: Upload Connection Details as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-connection-info
+          path: ${{ runner.temp }}/rdp_connection.txt
+          retention-days: 1
+
+      - name: Keep Session Active
         run: |
           $startTime = Get-Date
-          $timeoutMinutes = [int]${{ inputs.session_timeout }}
-          $endTime = $startTime.AddMinutes($timeoutMinutes)
+          $timeout = [int]${{ inputs.session_timeout }}
+          $endTime = $startTime.AddMinutes($timeout)
           
-          Write-Host "⏳ Session active. Press 'Cancel workflow' to end early."
+          Write-Host ""
+          Write-Host "⏳ RDP Session Active"
           Write-Host " Started: $startTime"
           Write-Host " Will end: $endTime"
           Write-Host ""
+          Write-Host "📋 Connection Information (also saved as artifact):"
+          Write-Host " Username: $env:RDP_USERNAME"
+          Write-Host " Password: $env:RDP_PASSWORD"
           
-          # Simple keep-alive loop
+          if ($env:PUBLIC_IP -ne "unknown") {
+              Write-Host " Public IP: $env:PUBLIC_IP"
+          }
+          Write-Host " Local IP: $env:LOCAL_IP"
+          Write-Host ""
+          Write-Host "🔧 To connect: Open Remote Desktop (mstsc.exe) and enter IP"
+          Write-Host "❌ To end session: Click 'Cancel workflow' in GitHub Actions"
+          Write-Host ""
+          
+          # Heartbeat loop
           while ($true) {
               $now = Get-Date
               $remaining = $endTime - $now
@@ -331,18 +270,10 @@ jobs:
                   break
               }
               
-              $minutesLeft = [math]::Round($remaining.TotalMinutes, 1)
-              
-              # Update every 30 seconds
+              # Display remaining time every 30 seconds
               if ([math]::Floor(($now - $startTime).TotalSeconds) % 30 -eq 0) {
+                  $minutesLeft = [math]::Round($remaining.TotalMinutes, 1)
                   Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Active - $minutesLeft minutes remaining"
-              }
-              
-              # Keep RDP service running
-              $service = Get-Service TermService -ErrorAction SilentlyContinue
-              if ($service.Status -ne 'Running') {
-                  Write-Host "⚠️ RDP service stopped, restarting..."
-                  Start-Service TermService -ErrorAction SilentlyContinue
               }
               
               Start-Sleep -Seconds 1
