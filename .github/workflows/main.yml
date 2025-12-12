@@ -1,12 +1,12 @@
-name: Windows RDP Keep Alive with Password
+name: Windows RDP Setup
 
 on:
   workflow_dispatch:
     inputs:
       session_timeout:
-        description: 'Session duration in minutes (10-480)'
+        description: 'Session duration in minutes'
         required: false
-        default: '120'
+        default: '60'
         type: string
 
 jobs:
@@ -15,76 +15,47 @@ jobs:
     timeout-minutes: ${{ fromJSON(inputs.session_timeout) }}
 
     steps:
-      - name: Initialize Setup
+      - name: Start RDP Session
         run: |
-          Write-Host "🚀 Starting Windows RDP Session"
+          Write-Host "Starting Windows RDP Session"
           Write-Host "Workflow ID: $env:GITHUB_RUN_ID"
-          Write-Host "Session Duration: ${{ inputs.session_timeout }} minutes"
 
-      - name: Configure Remote Desktop
+      - name: Enable Remote Desktop
         run: |
-          Write-Host "🔧 Configuring Remote Desktop..."
-          
           # Enable RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           
-          # Disable NLA for wider compatibility
+          # Configure security
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
           
           # Configure firewall
           netsh advfirewall firewall delete rule name="GitHub-RDP" 2>$null
-          netsh advfirewall firewall add rule name="GitHub-RDP" dir=in action=allow protocol=TCP localport=3389 description="GitHub Actions RDP Session"
+          netsh advfirewall firewall add rule name="GitHub-RDP" dir=in action=allow protocol=TCP localport=3389
           
           # Restart service
           Restart-Service -Name TermService -Force
           
-          Write-Host "✅ Remote Desktop configured"
+          Write-Host "Remote Desktop enabled"
 
-      - name: Generate Secure Password
+      - name: Create User with Password
         run: |
-          Write-Host "🔐 Generating Windows-compliant password..."
-          
-          # Windows password requirements: at least 8 chars, uppercase, lowercase, number, special char
+          # Generate password that meets Windows requirements
           $uppercase = "ABCDEFGHJKLMNPQRSTUVWXYZ"
           $lowercase = "abcdefghijkmnpqrstuvwxyz"
           $numbers = "23456789"
           $special = "!@#$%^&*"
           
-          # Generate password meeting all requirements
+          # Create 8-character password
           $password = ""
           $password += $uppercase[(Get-Random -Maximum $uppercase.Length)]
           $password += $lowercase[(Get-Random -Maximum $lowercase.Length)]
           $password += $numbers[(Get-Random -Maximum $numbers.Length)]
           $password += $special[(Get-Random -Maximum $special.Length)]
-          
-          # Add 4 more random characters for length
-          $allChars = $uppercase + $lowercase + $numbers + $special
-          for ($i = 0; $i -lt 4; $i++) {
-              $password += $allChars[(Get-Random -Maximum $allChars.Length)]
-          }
-          
-          # Shuffle the characters
-          $password = -join ($password.ToCharArray() | Get-Random -Count $password.Length)
-          
-          # Show password (won't be masked)
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "🔑 Generated Password: $password"
-          Write-Host "========================================"
-          Write-Host ""
-          
-          # Save password to file
-          $password | Out-File -FilePath "$env:RUNNER_TEMP dp_password.txt" -NoNewline
-          
-          Write-Host "✅ Password generated and saved"
-
-      - name: Create User Account
-        run: |
-          Write-Host "👤 Creating RDP user account..."
-          
-          # Read password from file
-          $password = Get-Content "$env:RUNNER_TEMP dp_password.txt" -Raw
+          $password += $uppercase[(Get-Random -Maximum $uppercase.Length)]
+          $password += $lowercase[(Get-Random -Maximum $lowercase.Length)]
+          $password += $numbers[(Get-Random -Maximum $numbers.Length)]
+          $password += $special[(Get-Random -Maximum $special.Length)]
           
           # Create user
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
@@ -97,175 +68,79 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
           
-          Write-Host "✅ User 'RDPUser' created successfully"
-          Write-Host "🔑 Password: $password"
-
-      - name: Get Network Information
-        run: |
-          Write-Host "🌐 Getting network information..."
+          # Save password to file
+          $password | Out-File -FilePath "$env:RUNNER_TEMP\password.txt" -NoNewline
           
+          # Display password
+          Write-Host "Username: RDPUser"
+          Write-Host "Password: $password"
+
+      - name: Get Network Info
+        run: |
           # Get public IP
           try {
-              $publicIP = (Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 5).Trim()
-              Write-Host "✅ Public IP: $publicIP"
+              $publicIP = (Invoke-RestMethod -Uri "https://api.ipify.org").Trim()
           } catch {
-              $publicIP = "Not available"
-              Write-Host "⚠️ Could not get public IP"
+              $publicIP = "Unknown"
           }
           
           # Get local IP
-          $localIP = (Get-NetIPAddress -AddressFamily IPv4 | 
-                      Where-Object {$_.IPAddress -ne "127.0.0.1" -and $_.PrefixOrigin -eq "Dhcp"} |
-                      Select-Object -First 1).IPAddress
+          $localIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -ne "127.0.0.1"} | Select-Object -First 1).IPAddress
           
-          if (-not $localIP) {
-              $localIP = (Get-NetIPAddress -AddressFamily IPv4 | 
-                         Where-Object {$_.IPAddress -ne "127.0.0.1"} |
-                         Select-Object -First 1).IPAddress
-          }
-          
-          Write-Host "🔗 Local IP: $localIP"
-          
-          # Save to environment
-          echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
-          echo "LOCAL_IP=$localIP" >> $env:GITHUB_ENV
-          
-          # Create connection info file
-          $password = Get-Content "$env:RUNNER_TEMP dp_password.txt" -Raw
-          $connectionInfo = @"
-RDP Connection Information
-============
-Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-Workflow: $env:GITHUB_RUN_ID
-
-Username: RDPUser
-Password: $password
-
-Connection Addresses:
-1. Public IP: $publicIP
-2. Local IP: $localIP
-
-Connection Commands:
-mstsc /v:$publicIP
-or
-mstsc /v:$localIP
-
-Session Duration: ${{ inputs.session_timeout }} minutes
+          # Save to file
+          $networkInfo = @"
+Public IP: $publicIP
+Local IP: $localIP
 "@
+          $networkInfo | Out-File -FilePath "$env:RUNNER_TEMP etwork.txt"
           
-          $connectionInfo | Out-File -FilePath "$env:RUNNER_TEMP\connection_info.txt"
-          Write-Host "✅ Connection info saved"
+          Write-Host "Public IP: $publicIP"
+          Write-Host "Local IP: $localIP"
 
-      - name: Test RDP Connection
+      - name: Show Connection Info
         run: |
-          Write-Host "🧪 Testing RDP port..."
-          Start-Sleep -Seconds 3
-          
-          $portTest = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -InformationLevel Quiet
-          if ($portTest) {
-              Write-Host "✅ RDP port 3389 is open"
-          } else {
-              Write-Host "⚠️ RDP port test failed, but connection may still work"
-          }
-
-      - name: Display Connection Information
-        run: |
-          # Read password from file
-          $password = Get-Content "$env:RUNNER_TEMP dp_password.txt" -Raw
+          $password = Get-Content "$env:RUNNER_TEMP\password.txt" -Raw
+          $network = Get-Content "$env:RUNNER_TEMP etwork.txt" -Raw
           
           Write-Host ""
-          Write-Host "🚨🚨🚨 IMPORTANT: COPY THIS INFORMATION NOW! 🚨🚨🚨"
-          Write-Host "══════════════════════════════════════════════════"
+          Write-Host "=" * 50
+          Write-Host "RDP CONNECTION READY"
+          Write-Host "=" * 50
           Write-Host ""
-          Write-Host "🔐 Login Credentials:"
-          Write-Host " Username: RDPUser"
-          Write-Host " Password: $password"
+          Write-Host "Username: RDPUser"
+          Write-Host "Password: $password"
           Write-Host ""
-          Write-Host "📍 Connection Addresses:"
-          Write-Host " Public IP: $env:PUBLIC_IP"
-          Write-Host " Local IP: $env:LOCAL_IP"
+          Write-Host "Connect using:"
+          Write-Host $network
           Write-Host ""
-          Write-Host "💻 Quick Connect Commands:"
-          Write-Host " mstsc /v:$env:PUBLIC_IP"
-          Write-Host " or"
-          Write-Host " mstsc /v:$env:LOCAL_IP"
-          Write-Host ""
-          Write-Host "⏰ Session Information:"
-          Write-Host " Duration: ${{ inputs.session_timeout }} minutes"
-          Write-Host " Workflow ID: $env:GITHUB_RUN_ID"
-          Write-Host ""
-          Write-Host "📝 Notes:"
-          Write-Host " 1. Copy the password now - window will stay open"
-          Write-Host " 2. Session will run for ${{ inputs.session_timeout }} minutes"
-          Write-Host " 3. To end early, click 'Cancel workflow'"
-          Write-Host ""
-          Write-Host "══════════════════════════════════════════════════"
-          Write-Host ""
+          Write-Host "Session will end in ${{ inputs.session_timeout }} minutes"
+          Write-Host "=" * 50
 
-      - name: Upload Connection Info for Download
-        uses: actions/upload-artifact@v4
-        with:
-          name: rdp-connection-details
-          path: |
-            ${{ runner.temp }}/rdp_password.txt
-            ${{ runner.temp }}/connection_info.txt
-          retention-days: 1
-
-      - name: Keep Session Running (Will Not End)
+      - name: Keep Session Alive
         run: |
           $startTime = Get-Date
-          $timeoutMinutes = [int]${{ inputs.session_timeout }}
-          $endTime = $startTime.AddMinutes($timeoutMinutes)
+          $endTime = (Get-Date).AddMinutes(${{ inputs.session_timeout }})
           
-          # Display start info
-          Write-Host ""
-          Write-Host "🟢 RDP Session Started, Running..."
-          Write-Host " Start Time: $startTime"
-          Write-Host " End Time: $endTime"
-          Write-Host " Time Remaining: $timeoutMinutes minutes"
-          Write-Host ""
+          # Read password again
+          $password = Get-Content "$env:RUNNER_TEMP\password.txt" -Raw
           
-          # Show connection info again (for easy viewing)
-          $password = Get-Content "$env:RUNNER_TEMP dp_password.txt" -Raw
-          Write-Host "📋 Connection Summary:"
-          Write-Host " Username: RDPUser"
-          Write-Host " Password: $password"
-          Write-Host " Public IP: $env:PUBLIC_IP"
-          Write-Host " Local IP: $env:LOCAL_IP"
           Write-Host ""
-          Write-Host "🔧 Use Remote Desktop Connection (mstsc.exe) with above info"
-          Write-Host "❌ To end session: Click 'Cancel workflow' in GitHub Actions"
+          Write-Host "Session running. Press Ctrl+C or Cancel workflow to stop."
+          Write-Host "Username: RDPUser"
+          Write-Host "Password: $password"
+          Write-Host "Started: $startTime"
+          Write-Host "Will end: $endTime"
           Write-Host ""
           
-          # Heartbeat loop - keep workflow running
-          $checkCount = 0
-          while ($true) {
-              $now = Get-Date
-              $remaining = $endTime - $now
+          while ((Get-Date) -lt $endTime) {
+              $remaining = $endTime - (Get-Date)
+              $minutes = [math]::Round($remaining.TotalMinutes, 1)
               
-              # Check if timeout reached
-              if ($remaining.TotalSeconds -le 0) {
-                  Write-Host "⏰ Session timeout, auto-ending"
-                  break
+              if ([math]::Floor(((Get-Date) - $startTime).TotalSeconds) % 30 -eq 0) {
+                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Running - $minutes minutes left"
               }
               
-              # Show status every minute
-              if ($checkCount % 60 -eq 0) {
-                  $minutesLeft = [math]::Round($remaining.TotalMinutes, 1)
-                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session Active - $minutesLeft minutes left"
-                  
-                  # Check service status every 5 minutes
-                  if ($checkCount % 300 -eq 0) {
-                      $rdpService = Get-Service TermService -ErrorAction SilentlyContinue
-                      if ($rdpService.Status -ne 'Running') {
-                          Write-Host "⚠️ RDP service stopped, restarting..."
-                          Start-Service TermService -Force -ErrorAction SilentlyContinue
-                      }
-                  }
-              }
-              
-              $checkCount++
-              Start-Sleep -Seconds 1 # Check every second
+              Start-Sleep -Seconds 1
           }
           
-          Write-Host "🛑 Session ended at $(Get-Date)"
+          Write-Host "Session ended at $(Get-Date)"
