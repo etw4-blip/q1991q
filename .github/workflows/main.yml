@@ -1,122 +1,277 @@
-name: Windows RDP with Visible Password
+name: Windows RDP Keep Alive with Password
 
 on:
   workflow_dispatch:
     inputs:
       session_timeout:
-        description: 'Session duration in minutes'
+        description: 'Session duration in minutes (10-480)'
         required: false
-        default: '60'
+        default: '120'
         type: string
 
 jobs:
-  setup-rdp:
+  rdp-session:
     runs-on: windows-latest
     timeout-minutes: ${{ fromJSON(inputs.session_timeout) }}
 
     steps:
-      - name: 启用远程桌面
+      - name: 初始化设置
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          netsh advfirewall firewall add rule name="RDP-公开" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
-          Write-Host "✅ 远程桌面已启用"
+          Write-Host "🚀 启动 Windows RDP 会话"
+          Write-Host "工作流 ID: $env:GITHUB_RUN_ID"
+          Write-Host "会话时长: ${{ inputs.session_timeout }} 分钟"
 
-      - name: 创建用户并生成密码
+      - name: 配置远程桌面
         run: |
-          # 生成简单密码：RDP + 随机6位数字
-          $randomNum = Get-Random -Minimum 100000 -Maximum 999999
-          $password = "RDP$randomNum"
+          Write-Host "🔧 配置远程桌面设置..."
+          
+          # 启用 RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # 禁用 NLA 以便更广泛兼容
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 0 -Force
+          
+          # 配置防火墙
+          netsh advfirewall firewall delete rule name="GitHub-RDP" 2>$null
+          netsh advfirewall firewall add rule `
+            name="GitHub-RDP" `
+            dir=in action=allow protocol=TCP localport=3389 `
+            description="GitHub Actions RDP Session"
+          
+          # 重启服务
+          Restart-Service -Name TermService -Force
+          
+          Write-Host "✅ 远程桌面配置完成"
+
+      - name: 创建符合复杂性的密码
+        run: |
+          Write-Host "🔐 生成符合 Windows 复杂性要求的密码..."
+          
+          # Windows 密码复杂性要求：至少8个字符，包含大写字母、小写字母、数字和特殊字符
+          $uppercase = "ABCDEFGHJKLMNPQRSTUVWXYZ" # 去掉 I 和 O 避免混淆
+          $lowercase = "abcdefghijkmnpqrstuvwxyz" # 去掉 l 和 o 避免混淆
+          $numbers = "23456789" # 去掉 0 和 1 避免混淆
+          $special = "!@#$%^&*"
+          
+          # 生成密码：确保符合所有要求
+          $password = ""
+          $password += $uppercase[(Get-Random -Maximum $uppercase.Length)]
+          $password += $lowercase[(Get-Random -Maximum $lowercase.Length)]
+          $password += $numbers[(Get-Random -Maximum $numbers.Length)]
+          $password += $special[(Get-Random -Maximum $special.Length)]
+          
+          # 添加4个随机字符以确保长度
+          $allChars = $uppercase + $lowercase + $numbers + $special
+          for ($i = 0; $i -lt 4; $i++) {
+              $password += $allChars[(Get-Random -Maximum $allChars.Length)]
+          }
+          
+          # 将密码打乱顺序
+          $password = -join ($password.ToCharArray() | Get-Random -Count $password.Length)
+          
+          # 显示密码（不会被屏蔽）
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "🔑 生成的密码: $password"
+          Write-Host "========================================"
+          Write-Host ""
+          
+          # 保存密码到文件
+          $password | Out-File -FilePath "$env:RUNNER_TEMP dp_password.txt" -NoNewline
+          
+          Write-Host "✅ 密码已生成并保存"
+
+      - name: 创建用户账户
+        run: |
+          Write-Host "👤 创建 RDP 用户账户..."
+          
+          # 从文件读取密码
+          $password = Get-Content "$env:RUNNER_TEMP dp_password.txt" -Raw
           
           # 创建用户
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # 删除已存在的同名用户（如果存在）
+          Remove-LocalUser -Name "RDPUser" -ErrorAction SilentlyContinue
+          
+          # 创建新用户
           New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
           
-          # 将密码保存到文件
-          $password | Out-File -FilePath "$env:RUNNER_TEMP\password.txt"
-          
-          # 关键：直接输出密码（不使用add-mask）
-          Write-Host "=========================================="
-          Write-Host "✅ 用户创建成功"
-          Write-Host "用户名: RDPUser"
-          Write-Host "密码: $password"
-          Write-Host "=========================================="
-          
-          # 保存到环境变量
-          echo "RDP_USERNAME=RDPUser" >> $env:GITHUB_ENV
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "✅ 用户 'RDPUser' 创建成功"
+          Write-Host "🔑 密码: $password"
 
       - name: 获取网络信息
         run: |
-          # 获取公网IP
+          Write-Host "🌐 获取网络信息..."
+          
+          # 获取公网 IP
           try {
-              $publicIP = (Invoke-RestMethod -Uri "https://api.ipify.org").Trim()
+              $publicIP = (Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 5).Trim()
+              Write-Host "✅ 公网IP: $publicIP"
           } catch {
               $publicIP = "无法获取"
+              Write-Host "⚠️ 无法获取公网IP"
           }
           
-          # 获取本地IP
-          $localIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -ne "127.0.0.1"} | Select-Object -First 1).IPAddress
+          # 获取本地 IP
+          $localIP = (Get-NetIPAddress -AddressFamily IPv4 | 
+                      Where-Object {$_.IPAddress -ne "127.0.0.1" -and $_.PrefixOrigin -eq "Dhcp"} |
+                      Select-Object -First 1).IPAddress
           
+          if (-not $localIP) {
+              $localIP = (Get-NetIPAddress -AddressFamily IPv4 | 
+                         Where-Object {$_.IPAddress -ne "127.0.0.1"} |
+                         Select-Object -First 1).IPAddress
+          }
+          
+          Write-Host "🔗 本地IP: $localIP"
+          
+          # 保存到环境变量
           echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
           echo "LOCAL_IP=$localIP" >> $env:GITHUB_ENV
           
-          Write-Host "公网IP: $publicIP"
-          Write-Host "本地IP: $localIP"
+          # 创建连接信息文件
+          $password = Get-Content "$env:RUNNER_TEMP dp_password.txt" -Raw
+          $connectionInfo = @"
+RDP 连接信息
+============
+时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+工作流: $env:GITHUB_RUN_ID
 
-      - name: 显示所有连接信息（密码会显示）
+用户名: RDPUser
+密码: $password
+
+连接地址:
+1. 公网IP: $publicIP
+2. 本地IP: $localIP
+
+连接命令:
+mstsc /v:$publicIP
+或
+mstsc /v:$localIP
+
+会话时长: ${{ inputs.session_timeout }} 分钟
+"@
+          
+          $connectionInfo | Out-File -FilePath "$env:RUNNER_TEMP\connection_info.txt"
+          Write-Host "✅ 连接信息已保存"
+
+      - name: 测试 RDP 连接
         run: |
-          # 从环境变量读取
-          $username = $env:RDP_USERNAME
-          $password = $env:RDP_PASSWORD
-          $publicIP = $env:PUBLIC_IP
-          $localIP = $env:LOCAL_IP
+          Write-Host "🧪 测试 RDP 端口..."
+          Start-Sleep -Seconds 3
+          
+          $portTest = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -InformationLevel Quiet
+          if ($portTest) {
+              Write-Host "✅ RDP 端口 3389 已开放"
+          } else {
+              Write-Host "⚠️ RDP 端口测试失败，但可能仍可连接"
+          }
+
+      - name: 显示连接信息
+        run: |
+          # 从文件读取密码
+          $password = Get-Content "$env:RUNNER_TEMP dp_password.txt" -Raw
           
           Write-Host ""
-          Write-Host "══════════════════════════════════════════════════"
-          Write-Host "🚨 立即复制以下信息！密码会显示在此 🚨"
+          Write-Host "🚨🚨🚨 重要：立即复制以下信息！ 🚨🚨🚨"
           Write-Host "══════════════════════════════════════════════════"
           Write-Host ""
-          Write-Host "👤 用户名: $username"
-          Write-Host "🔑 密码: $password"
+          Write-Host "🔐 登录凭据："
+          Write-Host " 用户名: RDPUser"
+          Write-Host " 密　码: $password"
           Write-Host ""
           Write-Host "📍 连接地址："
-          Write-Host " 1. 公网IP: $publicIP"
-          Write-Host " 2. 本地IP: $localIP"
+          Write-Host " 公网IP: $env:PUBLIC_IP"
+          Write-Host " 本地IP: $env:LOCAL_IP"
           Write-Host ""
-          Write-Host "💻 连接命令："
-          Write-Host " mstsc /v:$publicIP"
+          Write-Host "💻 快速连接命令："
+          Write-Host " mstsc /v:$env:PUBLIC_IP"
           Write-Host " 或"
-          Write-Host " mstsc /v:$localIP"
+          Write-Host " mstsc /v:$env:LOCAL_IP"
           Write-Host ""
-          Write-Host "⏰ 会话时长: ${{ inputs.session_timeout }} 分钟"
+          Write-Host "⏰ 会话信息："
+          Write-Host " 时长: ${{ inputs.session_timeout }} 分钟"
+          Write-Host " 工作流ID: $env:GITHUB_RUN_ID"
           Write-Host ""
-          Write-Host "📝 注意：此信息仅在本次运行中有效！"
+          Write-Host "📝 注意："
+          Write-Host " 1. 立即复制密码，窗口不会关闭"
+          Write-Host " 2. 会话将持续 ${{ inputs.session_timeout }} 分钟"
+          Write-Host " 3. 要提前结束，点击 'Cancel workflow'"
+          Write-Host ""
           Write-Host "══════════════════════════════════════════════════"
+          Write-Host ""
 
-      - name: 保持会话
+      - name: 上传连接信息供下载
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-connection-details
+          path: |
+            ${{ runner.temp }}/rdp_password.txt
+            ${{ runner.temp }}/connection_info.txt
+          retention-days: 1
+
+      - name: 保持会话运行（不会结束）
         run: |
           $startTime = Get-Date
-          $endTime = (Get-Date).AddMinutes(${{ inputs.session_timeout }})
+          $timeoutMinutes = [int]${{ inputs.session_timeout }}
+          $endTime = $startTime.AddMinutes($timeoutMinutes)
           
-          Write-Host "会话已启动，将运行 ${{ inputs.session_timeout }} 分钟"
-          Write-Host "用户名: $env:RDP_USERNAME"
-          Write-Host "密码: $env:RDP_PASSWORD"
-          Write-Host "IP地址: $env:PUBLIC_IP"
+          # 显示开始信息
           Write-Host ""
-          Write-Host "按 Ctrl+C 或取消工作流以提前结束"
+          Write-Host "🟢 RDP 会话已启动，正在运行..."
+          Write-Host " 开始时间: $startTime"
+          Write-Host " 结束时间: $endTime"
+          Write-Host " 剩余时间: $timeoutMinutes 分钟"
+          Write-Host ""
           
-          while ((Get-Date) -lt $endTime) {
-              $remaining = $endTime - (Get-Date)
-              $minutes = [math]::Round($remaining.TotalMinutes, 1)
+          # 再次显示连接信息（方便查看）
+          $password = Get-Content "$env:RUNNER_TEMP dp_password.txt" -Raw
+          Write-Host "📋 连接信息汇总："
+          Write-Host " 用户名: RDPUser"
+          Write-Host " 密　码: $password"
+          Write-Host " 公网IP: $env:PUBLIC_IP"
+          Write-Host " 本地IP: $env:LOCAL_IP"
+          Write-Host ""
+          Write-Host "🔧 使用远程桌面连接 (mstsc.exe) 输入上述信息"
+          Write-Host "❌ 要结束会话：点击 GitHub Actions 中的 'Cancel workflow'"
+          Write-Host ""
+          
+          # 心跳循环 - 保持工作流运行
+          $checkCount = 0
+          while ($true) {
+              $now = Get-Date
+              $remaining = $endTime - $now
               
-              if ([math]::Floor(((Get-Date) - $startTime).TotalSeconds) % 30 -eq 0) {
-                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] 运行中 - 剩余 $minutes 分钟"
+              # 检查是否超时
+              if ($remaining.TotalSeconds -le 0) {
+                  Write-Host "⏰ 会话超时，自动结束"
+                  break
               }
               
-              Start-Sleep -Seconds 1
+              # 每分钟显示一次状态
+              if ($checkCount % 60 -eq 0) {
+                  $minutesLeft = [math]::Round($remaining.TotalMinutes, 1)
+                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] 会话活跃 - 剩余 $minutesLeft 分钟"
+                  
+                  # 每5分钟检查一次服务状态
+                  if ($checkCount % 300 -eq 0) {
+                      $rdpService = Get-Service TermService -ErrorAction SilentlyContinue
+                      if ($rdpService.Status -ne 'Running') {
+                          Write-Host "⚠️ RDP 服务停止，正在重启..."
+                          Start-Service TermService -Force -ErrorAction SilentlyContinue
+                      }
+                  }
+              }
+              
+              $checkCount++
+              Start-Sleep -Seconds 1 # 每秒检查一次
           }
           
-          Write-Host "会话已结束"
+          Write-Host "🛑 会话已结束于 $(Get-Date)"
