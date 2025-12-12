@@ -16,7 +16,7 @@ env:
 jobs:
   secure-rdp-session:
     runs-on: windows-latest
-    timeout-minutes: ${{ inputs.session_timeout }}
+    timeout-minutes: ${{ fromJSON(inputs.session_timeout) }}
 
     steps:
       - name: Check Session Timeout
@@ -24,6 +24,7 @@ jobs:
           $timeout = [int]${{ inputs.session_timeout }}
           if ($timeout -lt 10 -or $timeout -gt 360) {
             Write-Error "Timeout must be between 10 and 360 minutes"
+            Write-Output "::error::Session timeout must be between 10 and 360 minutes"
             exit 1
           }
           Write-Host "Session will timeout after $timeout minutes"
@@ -53,9 +54,41 @@ jobs:
 
       - name: Create RDP User
         run: |
-          # Generate password
-          Add-Type -AssemblyName System.Web
-          $password = [System.Web.Security.Membership]::GeneratePassword(16, 4)
+          # Generate secure password using PowerShell
+          function Generate-SecurePassword {
+              param(
+                  [int]$Length = 16,
+                  [int]$SpecialChars = 4
+              )
+              
+              $charSets = @{
+                  Lowercase = 'abcdefghijklmnopqrstuvwxyz'.ToCharArray()
+                  Uppercase = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.ToCharArray()
+                  Numbers = '0123456789'.ToCharArray()
+                  Special = '!@#$%^&*()_+-=[]{}|;:,.<>?'.ToCharArray()
+              }
+              
+              $passwordChars = @()
+              
+              # Add required special characters
+              for ($i = 0; $i -lt $SpecialChars; $i++) {
+                  $passwordChars += $charSets.Special | Get-Random
+              }
+              
+              # Add remaining characters from all character sets
+              $remainingLength = $Length - $SpecialChars
+              for ($i = 0; $i -lt $remainingLength; $i++) {
+                  $set = $charSets[(Get-Random -InputObject @('Lowercase', 'Uppercase', 'Numbers'))]
+                  $passwordChars += $set | Get-Random
+              }
+              
+              # Shuffle the characters
+              $shuffledChars = $passwordChars | Get-Random -Count $passwordChars.Count
+              
+              return -join $shuffledChars
+          }
+          
+          $password = Generate-SecurePassword -Length 16 -SpecialChars 4
           
           # Mask password in logs
           Write-Host "::add-mask::$password"
