@@ -107,49 +107,29 @@ jobs:
           
           Write-Host "✅ User created: $env:RDP_USERNAME"
 
-      - name: Install Tailscale (Fixed)
-        id: install_tailscale
+      - name: Install Tailscale with Chocolatey (更可靠)
         run: |
-          Write-Host "Installing Tailscale v$env:TAILSCALE_VERSION..."
+          Write-Host "Installing Tailscale using Chocolatey..."
           
-          # 下载Tailscale安装程序
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$env:TAILSCALE_VERSION-amd64.msi"
-          $installerPath = "$env:TEMP ailscale.msi"
-          
-          Write-Host "Downloading from: $tsUrl"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
-          
-          # 安装Tailscale
-          Write-Host "Installing Tailscale..."
-          $installArgs = @(
-            "/i",
-            "`"$installerPath`"",
-            "/quiet",
-            "/norestart",
-            "/log",
-            "$env:TEMP ailscale_install.log"
-          )
-          
-          $process = Start-Process msiexec.exe -ArgumentList $installArgs -Wait -NoNewWindow -PassThru
-          
-          if ($process.ExitCode -ne 0) {
-              Write-Host "Installation log content:"
-              Get-Content "$env:TEMP ailscale_install.log" -ErrorAction SilentlyContinue | Select-Object -Last 20
-              Write-Error "Tailscale installation failed with exit code: $($process.ExitCode)"
-              exit 1
+          # 检查是否已安装Chocolatey，如果没有则安装
+          if (!(Test-Path "$env:ProgramData\Chocolatey\choco.exe")) {
+              Write-Host "Installing Chocolatey..."
+              Set-ExecutionPolicy Bypass -Scope Process -Force
+              [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+              Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
           }
-          
-          # 清理安装文件
-          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-          
-          # 等待安装完成并刷新环境
-          Write-Host "Waiting for installation to complete..."
-          Start-Sleep -Seconds 10
           
           # 刷新环境变量
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
           
-          Write-Host "✅ Tailscale installation process completed"
+          # 使用Chocolatey安装Tailscale
+          Write-Host "Installing Tailscale via Chocolatey..."
+          choco install tailscale -y --no-progress
+          
+          # 等待安装完成
+          Start-Sleep -Seconds 5
+          
+          Write-Host "✅ Tailscale installed via Chocolatey"
 
       - name: Verify Tailscale Installation
         run: |
@@ -167,7 +147,7 @@ jobs:
           foreach ($path in $possiblePaths) {
               if (Test-Path $path) {
                   $tailscalePath = $path
-                  Write-Host "Found Tailscale at: $path"
+                  Write-Host "✅ Found Tailscale at: $path"
                   break
               }
           }
@@ -178,23 +158,58 @@ jobs:
               $searchResult = Get-ChildItem -Path "C:\" -Recurse -Filter "tailscale.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
               if ($searchResult) {
                   $tailscalePath = $searchResult.FullName
-                  Write-Host "Found via search: $tailscalePath"
+                  Write-Host "✅ Found via search: $tailscalePath"
               }
           }
           
           if ($tailscalePath) {
               # 测试Tailscale是否可执行
               Write-Host "Testing Tailscale executable..."
-              $version = & $tailscalePath version
-              Write-Host "Tailscale version: $version"
-              
-              echo "TAILSCALE_PATH=$tailscalePath" >> $env:GITHUB_ENV
-              Write-Host "✅ Tailscale verified successfully"
+              try {
+                  $version = & $tailscalePath version 2>$null
+                  Write-Host "Tailscale version: $version"
+                  
+                  echo "TAILSCALE_PATH=$tailscalePath" >> $env:GITHUB_ENV
+                  Write-Host "✅ Tailscale verified successfully"
+              } catch {
+                  Write-Host "⚠️ Could not get version, but executable exists"
+                  echo "TAILSCALE_PATH=$tailscalePath" >> $env:GITHUB_ENV
+              }
           } else {
               Write-Error "❌ Tailscale executable not found after installation"
               Write-Host "Checking installed programs..."
               Get-WmiObject -Class Win32_Product | Where-Object {$_.Name -like "*Tailscale*"} | Format-List Name, Version, InstallLocation
-              exit 1
+              
+              # 尝试备用安装方法
+              Write-Host "Attempting alternative installation method..."
+              
+              # 直接下载并安装
+              $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$env:TAILSCALE_VERSION-amd64.msi"
+              $installerPath = "$env:TEMP ailscale_direct.msi"
+              
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+              
+              # 使用msiexec安装
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/qn", "/norestart" -Wait
+              
+              Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+              
+              Start-Sleep -Seconds 5
+              
+              # 再次检查
+              foreach ($path in $possiblePaths) {
+                  if (Test-Path $path) {
+                      $tailscalePath = $path
+                      Write-Host "✅ Found Tailscale after alternative install: $path"
+                      echo "TAILSCALE_PATH=$tailscalePath" >> $env:GITHUB_ENV
+                      break
+                  }
+              }
+              
+              if (-not $tailscalePath) {
+                  Write-Error "❌ Failed to install Tailscale even with alternative method"
+                  exit 1
+              }
           }
 
       - name: Connect to Tailscale
@@ -204,16 +219,33 @@ jobs:
           $hostname = "gh-runner-$env:GITHUB_RUN_ID"
           Write-Host "Hostname: $hostname"
           
-          $tailscalePath = $env:TAILSCALE_PATH
+          # 如果TAILSCALE_PATH环境变量未设置，尝试查找
+          if (-not $env:TAILSCALE_PATH) {
+              Write-Host "TAILSCALE_PATH not set, searching..."
+              $possiblePaths = @(
+                  "$env:ProgramFiles\Tailscale ailscale.exe",
+                  "${env:ProgramFiles(x86)}\Tailscale ailscale.exe"
+              )
+              
+              foreach ($path in $possiblePaths) {
+                  if (Test-Path $path) {
+                      $env:TAILSCALE_PATH = $path
+                      Write-Host "Found Tailscale at: $path"
+                      break
+                  }
+              }
+          }
           
-          if (-not $tailscalePath) {
-              Write-Error "Tailscale path not set"
+          if (-not $env:TAILSCALE_PATH) {
+              Write-Error "Tailscale path not found"
               exit 1
           }
           
+          Write-Host "Using Tailscale from: $env:TAILSCALE_PATH"
+          
           # 连接Tailscale
-          Write-Host "Running: $tailscalePath up --authkey=*** --hostname=$hostname"
-          & $tailscalePath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
+          Write-Host "Running Tailscale up command..."
+          & $env:TAILSCALE_PATH up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
           
           # 等待IP分配
           Write-Host "Waiting for Tailscale IP assignment..."
@@ -221,7 +253,7 @@ jobs:
           $maxAttempts = 30
           
           for ($i = 1; $i -le $maxAttempts; $i++) {
-              $tsIP = & $tailscalePath ip -4 2>$null
+              $tsIP = & $env:TAILSCALE_PATH ip -4 2>$null
               if ($tsIP -and $tsIP.Trim() -ne "") {
                   Write-Host "✅ Tailscale IP obtained: $tsIP"
                   break
@@ -233,7 +265,7 @@ jobs:
           if (-not $tsIP) {
               Write-Error "❌ Failed to get Tailscale IP after $maxAttempts attempts"
               Write-Host "Tailscale status:"
-              & $tailscalePath status
+              & $env:TAILSCALE_PATH status
               exit 1
           }
           
@@ -320,15 +352,6 @@ jobs:
               if ([math]::Floor(($now - $startTime).TotalSeconds) % 30 -eq 0) {
                   $minutesLeft = [math]::Round($remaining.TotalMinutes, 1)
                   Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Active - $minutesLeft minutes remaining"
-              }
-              
-              # 定期检查服务状态
-              if ([math]::Floor(($now - $startTime).TotalSeconds) % 60 -eq 0) {
-                  $service = Get-Service TermService -ErrorAction SilentlyContinue
-                  if ($service.Status -ne 'Running') {
-                      Write-Host "⚠️ RDP service not running, restarting..."
-                      Start-Service TermService -ErrorAction SilentlyContinue
-                  }
               }
               
               Start-Sleep -Seconds 1
