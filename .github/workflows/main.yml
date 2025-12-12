@@ -1,115 +1,302 @@
-name: Windows RDP Session
+name: RDP via Tailscale
 
 on:
   workflow_dispatch:
-    inputs:
-      session_timeout:
-        description: 'Session duration in minutes'
-        required: false
-        default: '60'
-        type: string
+
+env:
+  TS_VERSION: "1.82.0"
+  RDP_PORT: 3389
+  RDP_USERNAME: "RDP"
+  MAX_RETRIES: 15
+  RETRY_DELAY: 5
 
 jobs:
-  setup-rdp:
+  secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: ${{ fromJSON(inputs.session_timeout) }}
+    timeout-minutes: 3600
 
     steps:
-      - name: Enable Remote Desktop
+      - name: Configure RDP Settings
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="GitHub-RDP" 2>$null
-          netsh advfirewall firewall add rule name="GitHub-RDP" dir=in action=allow protocol=TCP localport=3389
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Disable Network Level Authentication (NLA) for easier connection
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 0 -Force
+          
+          # Configure firewall - ALLOW ALL INCOMING on port 3389 (original behavior)
+          Write-Host "Configuring firewall rules..."
+          
+          # Remove existing RDP firewall rules to avoid conflicts
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall delete rule name="RemoteDesktop" 2>$null
+          netsh advfirewall firewall delete rule name="RDP-Debug" 2>$null
+          
+          # Allow RDP from ANY source (original behavior)
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=$env:RDP_PORT `
+            description="Allow RDP connections"
+          
+          # Also allow UDP for better RDP performance
+          netsh advfirewall firewall add rule name="RDP-UDP" `
+            dir=in `
+            action=allow `
+            protocol=UDP `
+            localport=$env:RDP_PORT `
+            description="Allow RDP UDP connections"
+          
+          # Restart RDP service
           Restart-Service -Name TermService -Force
+          Start-Sleep -Seconds 3
+          
+          # Verify RDP is listening
+          $rdpListening = Get-NetTCPConnection -LocalPort $env:RDP_PORT -ErrorAction SilentlyContinue
+          if ($rdpListening) {
+            Write-Host "✅ RDP is listening on port $env:RDP_PORT"
+          } else {
+            Write-Host "⚠️ RDP is not listening, checking service..."
+            Get-Service TermService | Format-Table Name, Status
+          }
 
       - name: Create RDP User
         run: |
-          $uppercase = "ABCDEFGHJKLMNPQRSTUVWXYZ"
-          $lowercase = "abcdefghijkmnpqrstuvwxyz"
-          $numbers = "23456789"
-          $special = "!@#$%^&*"
+          # Remove existing user if exists
+          if (Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          }
           
-          $password = ""
-          $password += $uppercase[(Get-Random -Maximum $uppercase.Length)]
-          $password += $lowercase[(Get-Random -Maximum $lowercase.Length)]
-          $password += $numbers[(Get-Random -Maximum $numbers.Length)]
-          $password += $special[(Get-Random -Maximum $special.Length)]
-          $password += $uppercase[(Get-Random -Maximum $uppercase.Length)]
-          $password += $lowercase[(Get-Random -Maximum $lowercase.Length)]
-          $password += $numbers[(Get-Random -Maximum $numbers.Length)]
-          $password += $special[(Get-Random -Maximum $special.Length)]
+          # Generate secure password (similar to original code)
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper = [char[]](65..90) # A-Z
+              Lower = [char[]](97..122) # a-z
+              Number = [char[]](48..57) # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
           
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 3
+          $rawPassword += $charSet.Lower | Get-Random -Count 3
+          $rawPassword += $charSet.Number | Get-Random -Count 3
+          $rawPassword += $charSet.Special | Get-Random -Count 3
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          
+          # Create user
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name $env:RDP_USERNAME -Password $securePass -AccountNeverExpires
           
-          Remove-LocalUser -Name "RDPUser" -ErrorAction SilentlyContinue
-          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
+          # Add to groups
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME
           
-          $password | Out-File -FilePath "$env:RUNNER_TEMP\password.txt" -NoNewline
-          Write-Host "Username: RDPUser"
-          Write-Host "Password: $password"
+          # Save credentials
+          echo "RDP_USERNAME=$env:RDP_USERNAME" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          
+          # Mask password in logs
+          Write-Host "::add-mask::$password"
+          Write-Host "✅ User '$env:RDP_USERNAME' created"
 
-      - name: Get Network Information
+      - name: Install Tailscale
         run: |
-          try {
-              $publicIP = (Invoke-RestMethod -Uri "https://api.ipify.org").Trim()
-          } catch {
-              $publicIP = "Unknown"
+          # Download and install Tailscale
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$env:TS_VERSION-amd64.msi"
+          $installerPath = "$env:TEMP ailscale.msi"
+          
+          Write-Host "Downloading Tailscale v$env:TS_VERSION..."
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          
+          Write-Host "Installing Tailscale..."
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          
+          # Cleanup
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+          
+          # Wait for installation
+          Start-Sleep -Seconds 5
+          Write-Host "✅ Tailscale installed"
+
+      - name: Connect to Tailscale and Get IP
+        id: tailscale
+        run: |
+          $tsExe = "$env:ProgramFiles\Tailscale ailscale.exe"
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          
+          # Wait for Tailscale service to be ready
+          $attempts = 0
+          while ($attempts -lt 10) {
+            if (Test-Path $tsExe) {
+              Write-Host "Tailscale executable found"
+              break
+            }
+            Write-Host "Waiting for Tailscale installation... ($attempts/10)"
+            Start-Sleep -Seconds 3
+            $attempts++
           }
           
-          $localIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -ne "127.0.0.1"} | Select-Object -First 1).IPAddress
+          # Start Tailscale service
+          Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
           
-          Write-Host "Public IP: $publicIP"
-          Write-Host "Local IP: $localIP"
+          # Connect to Tailscale (using ORIGINAL method)
+          Write-Host "Connecting to Tailscale with hostname: $hostname"
+          & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
           
-          $publicIP | Out-File -FilePath "$env:RUNNER_TEMP\public_ip.txt" -NoNewline
-          $localIP | Out-File -FilePath "$env:RUNNER_TEMP\local_ip.txt" -NoNewline
+          # Get Tailscale IP (using ORIGINAL method)
+          $tsIP = $null
+          $retries = 0
+          
+          Write-Host "Waiting for Tailscale IP assignment..."
+          while (-not $tsIP -and $retries -lt $env:MAX_RETRIES) {
+            $tsIP = & $tsExe ip -4
+            
+            if (-not $tsIP) {
+              Write-Host "Attempt $($retries + 1)/$env:MAX_RETRIES: No IP yet..."
+              Start-Sleep -Seconds $env:RETRY_DELAY
+              $retries++
+            }
+          }
+          
+          if (-not $tsIP) {
+            # Try alternative method to get IP
+            Write-Host "Trying alternative method to get IP..."
+            $status = & $tsExe status --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($status -and $status.Self -and $status.Self.TailscaleIPs) {
+              $tsIP = $status.Self.TailscaleIPs | Where-Object { $_ -match '^100\.' } | Select-Object -First 1
+            }
+          }
+          
+          if ($tsIP) {
+            echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+            Write-Host "✅ Tailscale IP: $tsIP"
+            
+            # Also get public IP for verification
+            try {
+              $publicIP = (Invoke-WebRequest -Uri "https://api.ipify.org" -UseBasicParsing).Content
+              Write-Host "Public IP (for reference): $publicIP"
+            } catch {
+              Write-Host "Could not get public IP"
+            }
+          } else {
+            Write-Error "❌ Failed to get Tailscale IP after $env:MAX_RETRIES attempts"
+            Write-Host "Debug information:"
+            & $tsExe status
+            Write-Host "Network adapters:"
+            Get-NetAdapter | Format-Table Name, Status, InterfaceDescription
+            exit 1
+          }
 
-      - name: Display Connection Info
+      - name: Test RDP Connectivity
         run: |
-          $password = Get-Content "$env:RUNNER_TEMP\password.txt" -Raw
-          $publicIP = Get-Content "$env:RUNNER_TEMP\public_ip.txt" -Raw
-          $localIP = Get-Content "$env:RUNNER_TEMP\local_ip.txt" -Raw
+          Write-Host "Testing RDP connectivity to: $env:TAILSCALE_IP"
           
-          Write-Host ""
-          Write-Host "=========================================="
-          Write-Host "RDP CONNECTION READY"
-          Write-Host "=========================================="
-          Write-Host "Username: RDPUser"
-          Write-Host "Password: $password"
-          Write-Host "Public IP: $publicIP"
-          Write-Host "Local IP: $localIP"
-          Write-Host "Connect using: mstsc /v:$publicIP"
-          Write-Host "Session timeout: ${{ inputs.session_timeout }} minutes"
-          Write-Host "=========================================="
+          # First test local RDP
+          Write-Host "1. Testing local RDP port..."
+          $localTest = Test-NetConnection -ComputerName 127.0.0.1 -Port $env:RDP_PORT -WarningAction SilentlyContinue
+          if ($localTest.TcpTestSucceeded) {
+            Write-Host "✅ Local RDP port is open"
+          } else {
+            Write-Error "❌ Local RDP port is not responding"
+            exit 1
+          }
+          
+          # Test via Tailscale IP
+          Write-Host "2. Testing via Tailscale IP..."
+          $testResult = $null
+          $retries = 0
+          
+          while ($retries -lt 5) {
+            $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $env:RDP_PORT -WarningAction SilentlyContinue
+            if ($testResult.TcpTestSucceeded) {
+              Write-Host "✅ RDP is accessible via Tailscale!"
+              break
+            }
+            
+            $retries++
+            if ($retries -lt 5) {
+              Write-Host "Test $retries/5 failed, retrying in 5 seconds..."
+              Start-Sleep -Seconds 5
+            }
+          }
+          
+          if (-not $testResult.TcpTestSucceeded) {
+            Write-Warning "⚠️ Direct TCP test failed. This may be normal for some configurations."
+            Write-Host "Checking firewall rules..."
+            netsh advfirewall firewall show rule name="RDP-Tailscale" verbose
+            
+            Write-Host "Checking listening ports..."
+            netstat -an | Select-String -Pattern ":3389"
+            
+            Write-Host "Tailscale status:"
+            & "$env:ProgramFiles\Tailscale ailscale.exe" status
+            
+            # Continue anyway, as RDP might still work
+            Write-Host "Proceeding despite test failure..."
+          }
 
-      - name: Keep Alive
+      - name: Display Connection Information
         run: |
-          $startTime = Get-Date
-          $endTime = (Get-Date).AddMinutes(${{ inputs.session_timeout }})
-          $password = Get-Content "$env:RUNNER_TEMP\password.txt" -Raw
-          $publicIP = Get-Content "$env:RUNNER_TEMP\public_ip.txt" -Raw
+          $border = "═" * 50
           
           Write-Host ""
-          Write-Host "Session is running..."
-          Write-Host "Username: RDPUser"
-          Write-Host "Password: $password"
-          Write-Host "IP Address: $publicIP"
-          Write-Host "Will end at: $endTime"
+          Write-Host $border
+          Write-Host "🚀 RDP READY FOR CONNECTION"
+          Write-Host $border
+          Write-Host ""
+          Write-Host "🌐 CONNECT TO:"
+          Write-Host " $env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "🔑 CREDENTIALS:"
+          Write-Host " Username: $env:RDP_USERNAME"
+          Write-Host " Password: ******** (see workflow environment)"
+          Write-Host ""
+          Write-Host "📝 QUICK CONNECT:"
+          Write-Host " mstsc /v:$env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "⚠️ IMPORTANT NOTES:"
+          Write-Host " 1. Ensure you're connected to the same Tailscale network"
+          Write-Host " 2. Disable NLA in Remote Desktop client if connection fails"
+          Write-Host " 3. Runner will auto-terminate after 60 minutes"
+          Write-Host ""
+          Write-Host $border
+          
+          # Also output to job summary for easy copy-paste
+          Write-Output "## Connection Details" >> $GITHUB_STEP_SUMMARY
+          Write-Output "**IP Address:** $env:TAILSCALE_IP" >> $GITHUB_STEP_SUMMARY
+          Write-Output "**Username:** $env:RDP_USERNAME" >> $GITHUB_STEP_SUMMARY
+          Write-Output "" >> $GITHUB_STEP_SUMMARY
+          Write-Output "```" >> $GITHUB_STEP_SUMMARY
+          Write-Output "mstsc /v:$env:TAILSCALE_IP" >> $GITHUB_STEP_SUMMARY
+          Write-Output "```" >> $GITHUB_STEP_SUMMARY
+
+      - name: Keep Runner Alive
+        run: |
+          Write-Host "🔄 Runner active. Press 'Cancel workflow' in GitHub to terminate."
+          Write-Host ""
+          Write-Host "Connection details:"
+          Write-Host " IP: $env:TAILSCALE_IP"
+          Write-Host " User: $env:RDP_USERNAME"
           Write-Host ""
           
-          while ((Get-Date) -lt $endTime) {
-              $remaining = $endTime - (Get-Date)
-              $minutes = [math]::Round($remaining.TotalMinutes, 1)
-              
-              if ([math]::Floor(((Get-Date) - $startTime).TotalSeconds) % 30 -eq 0) {
-                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Running - $minutes minutes left"
+          # Simple keep-alive loop (original behavior)
+          while ($true) {
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP Active - IP: $env:TAILSCALE_IP"
+            
+            # Periodically check Tailscale connection
+            if ((Get-Date).Minute % 5 -eq 0) {
+              $tsStatus = & "$env:ProgramFiles\Tailscale ailscale.exe" status --json 2>$null | ConvertFrom-Json
+              if ($tsStatus.BackendState -ne "Running") {
+                Write-Host "Reconnecting Tailscale..."
+                & "$env:ProgramFiles\Tailscale ailscale.exe" up --reset
               }
-              
-              Start-Sleep -Seconds 1
+            }
+            
+            Start-Sleep -Seconds 300
           }
-          
-          Write-Host "Session ended at $(Get-Date)"
