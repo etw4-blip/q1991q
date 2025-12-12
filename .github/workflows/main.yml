@@ -104,95 +104,202 @@ jobs:
           Write-Host "::add-mask::$password"
           Write-Host "✅ User '$env:RDP_USERNAME' created"
 
-      - name: Install Tailscale
+      - name: Install Tailscale (Robust Method)
         run: |
-          # Download and install Tailscale
+          Write-Host "=== Installing Tailscale (Robust Method) ==="
+          
+          # 方法1: 使用msiexec安装
+          Write-Host "Method 1: Installing via MSI..."
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$env:TS_VERSION-amd64.msi"
           $installerPath = "$env:TEMP ailscale.msi"
           
-          Write-Host "Downloading Tailscale v$env:TS_VERSION..."
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          # 下载安装包
+          try {
+            Write-Host "Downloading Tailscale from: $tsUrl"
+            Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+            Write-Host "Download completed. File size: $(Get-Item $installerPath | Select-Object -ExpandProperty Length) bytes"
+          } catch {
+            Write-Host "Download failed: $_"
+            # 尝试备用URL
+            $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+            Write-Host "Trying alternative URL: $tsUrl"
+            Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          }
           
-          Write-Host "Installing Tailscale..."
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          # 安装MSI包
+          Write-Host "Installing MSI package..."
+          $installArgs = @(
+            "/i", "`"$installerPath`"",
+            "/quiet",
+            "/norestart",
+            "/log", "$env:TEMP ailscale_install.log"
+          )
           
-          # Cleanup
+          $process = Start-Process msiexec.exe -ArgumentList $installArgs -Wait -PassThru -NoNewWindow
+          
+          if ($process.ExitCode -ne 0) {
+            Write-Warning "MSI installation returned exit code $($process.ExitCode)"
+            Write-Host "Installation log (last 20 lines):"
+            if (Test-Path "$env:TEMP ailscale_install.log") {
+              Get-Content "$env:TEMP ailscale_install.log" -Tail 20 -ErrorAction SilentlyContinue
+            }
+          } else {
+            Write-Host "MSI installation completed successfully"
+          }
+          
+          # 清理安装包
           Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
           
-          # Wait for installation
-          Start-Sleep -Seconds 5
+          # 等待安装完成
+          Start-Sleep -Seconds 10
           
-          # Verify installation
-          $tsPath = "$env:ProgramFiles\Tailscale ailscale.exe"
-          if (Test-Path $tsPath) {
-            Write-Host "✅ Tailscale installed successfully at $tsPath"
+          # 检查安装是否成功
+          $tsExePath = "$env:ProgramFiles\Tailscale ailscale.exe"
+          $tsExePathX86 = "${env:ProgramFiles(x86)}\Tailscale ailscale.exe"
+          
+          if (Test-Path $tsExePath) {
+            Write-Host "✅ Tailscale installed at: $tsExePath"
+          } elseif (Test-Path $tsExePathX86) {
+            Write-Host "✅ Tailscale installed at: $tsExePathX86"
+            $tsExePath = $tsExePathX86
           } else {
-            Write-Error "Tailscale installation failed - executable not found"
+            Write-Warning "Tailscale not found in standard locations. Trying method 2..."
+            
+            # 方法2: 使用winget安装 (如果可用)
+            Write-Host "Method 2: Trying winget installation..."
+            try {
+              winget install --id Tailscale.Tailscale --silent --accept-package-agreements --accept-source-agreements
+              Write-Host "Winget installation attempted"
+            } catch {
+              Write-Host "Winget installation failed or not available"
+            }
+            
+            # 等待并再次检查
+            Start-Sleep -Seconds 10
+            
+            if (Test-Path $tsExePath) {
+              Write-Host "✅ Tailscale found after winget attempt"
+            } else {
+              # 方法3: 直接下载并解压
+              Write-Host "Method 3: Trying direct download and extraction..."
+              $zipUrl = "https://pkgs.tailscale.com/stable/tailscale-$env:TS_VERSION-windows-amd64.zip"
+              $zipPath = "$env:TEMP ailscale.zip"
+              $extractPath = "$env:TEMP ailscale_extracted"
+              
+              try {
+                Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
+                Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+                
+                # 复制文件到程序目录
+                New-Item -ItemType Directory -Path "$env:ProgramFiles\Tailscale" -Force
+                Copy-Item "$extractPath ailscale.exe" "$env:ProgramFiles\Tailscale ailscale.exe" -Force
+                Copy-Item "$extractPath ailscaled.exe" "$env:ProgramFiles\Tailscale ailscaled.exe" -Force
+                
+                Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+                
+                Write-Host "Direct extraction completed"
+              } catch {
+                Write-Warning "Direct extraction failed: $_"
+              }
+            }
+          }
+          
+          # 最终检查
+          Start-Sleep -Seconds 5
+          if (Test-Path $tsExePath) {
+            Write-Host "✅ Tailscale installation verified: $tsExePath"
+            # 设置环境变量供后续步骤使用
+            echo "TAILSCALE_EXE=$tsExePath" >> $env:GITHUB_ENV
+          } else {
+            Write-Error "❌ Tailscale installation failed - executable not found"
+            Write-Host "Checking installed programs..."
+            Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -like "*Tailscale*" } | Format-List Name, Version
             exit 1
           }
 
       - name: Connect to Tailscale and Get IP
         id: tailscale
         run: |
-          # 修复路径问题 - 正确的Tailscale可执行文件路径
-          $tsExe = "$env:ProgramFiles\Tailscale ailscale.exe"
-          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          Write-Host "=== Connecting to Tailscale ==="
           
-          Write-Host "Tailscale executable path: $tsExe"
+          # 使用环境变量中的路径或默认路径
+          if ($env:TAILSCALE_EXE) {
+            $tsExe = $env:TAILSCALE_EXE
+          } else {
+            $tsExe = "$env:ProgramFiles\Tailscale ailscale.exe"
+          }
+          
+          Write-Host "Using Tailscale executable: $tsExe"
           
           # 检查Tailscale可执行文件是否存在
           if (-not (Test-Path $tsExe)) {
             Write-Error "Tailscale executable not found at $tsExe"
-            Write-Host "Checking Program Files directory..."
-            Get-ChildItem "$env:ProgramFiles\Tailscale" -ErrorAction SilentlyContinue
+            Write-Host "Searching for Tailscale executable..."
+            Get-ChildItem -Path "$env:ProgramFiles" -Filter "tailscale.exe" -Recurse -ErrorAction SilentlyContinue
+            Get-ChildItem -Path "${env:ProgramFiles(x86)}" -Filter "tailscale.exe" -Recurse -ErrorAction SilentlyContinue
             exit 1
           }
           
-          # 检查Tailscale服务
-          Write-Host "Checking Tailscale service..."
-          $service = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
-          if ($service) {
-            Write-Host "Tailscale service status: $($service.Status)"
-            if ($service.Status -ne 'Running') {
-              Write-Host "Starting Tailscale service..."
-              Start-Service -Name Tailscale -ErrorAction SilentlyContinue
-            }
-          } else {
-            Write-Host "Tailscale service not found, attempting to start manually..."
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          
+          # 显示Tailscale版本
+          Write-Host "Tailscale version:"
+          & $tsExe version
+          
+          # 确保Tailscale服务运行
+          Write-Host "Ensuring Tailscale service is running..."
+          try {
+            Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+          } catch {
+            Write-Host "Service not found, attempting to install..."
             & $tsExe install-system-daemon 2>$null
           }
           
-          Start-Sleep -Seconds 3
+          Start-Sleep -Seconds 5
           
-          # Connect to Tailscale
+          # 检查当前状态
+          Write-Host "Current Tailscale status:"
+          & $tsExe status 2>&1
+          
+          # 连接到Tailscale
           Write-Host "Connecting to Tailscale with hostname: $hostname"
-          & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
+          $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
           
-          # Get Tailscale IP
+          if ([string]::IsNullOrEmpty($authKey)) {
+            Write-Error "TAILSCALE_AUTH_KEY is not set. Please add it to repository secrets."
+            exit 1
+          }
+          
+          Write-Host "Auth key length: $($authKey.Length)"
+          & $tsExe up --authkey=$authKey --hostname=$hostname --reset
+          
+          # 等待并获取IP
           $tsIP = $null
           $retries = 0
           
           Write-Host "Waiting for Tailscale IP assignment..."
           while (-not $tsIP -and $retries -lt $env:MAX_RETRIES) {
-            $tsIP = & $tsExe ip -4
+            Write-Host "Attempt $($retries + 1)/$env:MAX_RETRIES..."
+            
+            # 获取IPv4地址
+            $tsIP = & $tsExe ip -4 2>$null
             
             if (-not $tsIP) {
-              Write-Host "Attempt $($retries + 1)/$env:MAX_RETRIES: No IP yet..."
+              # 尝试JSON方式获取
+              try {
+                $status = & $tsExe status --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($status -and $status.Self -and $status.Self.TailscaleIPs) {
+                  $tsIP = $status.Self.TailscaleIPs | Where-Object { $_ -match '^100\.' } | Select-Object -First 1
+                }
+              } catch {
+                # 忽略JSON解析错误
+              }
+            }
+            
+            if (-not $tsIP) {
               Start-Sleep -Seconds $env:RETRY_DELAY
               $retries++
-            }
-          }
-          
-          if (-not $tsIP) {
-            # Try alternative method to get IP
-            Write-Host "Trying alternative method to get IP..."
-            try {
-              $status = & $tsExe status --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
-              if ($status -and $status.Self -and $status.Self.TailscaleIPs) {
-                $tsIP = $status.Self.TailscaleIPs | Where-Object { $_ -match '^100\.' } | Select-Object -First 1
-              }
-            } catch {
-              Write-Host "Could not parse JSON status"
             }
           }
           
@@ -200,24 +307,21 @@ jobs:
             echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
             Write-Host "✅ Tailscale IP: $tsIP"
             
-            # 显示完整的Tailscale状态
-            Write-Host "Tailscale status:"
-            & $tsExe status
+            # 显示完整状态
+            Write-Host "Tailscale full status:"
+            & $tsExe status --json | ConvertFrom-Json | Select-Object BackendState, MagicDNSSuffix, Self | Format-List
             
-            # 尝试获取公共IP作为参考
-            try {
-              $publicIP = (Invoke-WebRequest -Uri "https://api.ipify.org" -UseBasicParsing -TimeoutSec 5).Content
-              Write-Host "Public IP (for reference): $publicIP"
-            } catch {
-              Write-Host "Note: Could not get public IP (may be behind firewall)"
-            }
+            # 显示网络适配器
+            Write-Host "Network adapters (filtered):"
+            Get-NetAdapter | Where-Object { $_.Name -like "*Tailscale*" } | Format-Table Name, Status, MacAddress
           } else {
             Write-Error "❌ Failed to get Tailscale IP after $env:MAX_RETRIES attempts"
             Write-Host "Debug information:"
+            Write-Host "1. Tailscale status:"
             & $tsExe status
-            Write-Host "Network adapters:"
+            Write-Host "2. Network adapters:"
             Get-NetAdapter | Format-Table Name, Status, InterfaceDescription
-            Write-Host "IP addresses:"
+            Write-Host "3. IP addresses:"
             Get-NetIPAddress | Where-Object { $_.AddressFamily -eq 'IPv4' } | Format-Table InterfaceAlias, IPAddress
             exit 1
           }
@@ -264,7 +368,11 @@ jobs:
             netstat -an | Select-String -Pattern ":3389"
             
             Write-Host "Tailscale status:"
-            & "$env:ProgramFiles\Tailscale ailscale.exe" status
+            if ($env:TAILSCALE_EXE) {
+              & $env:TAILSCALE_EXE status
+            } else {
+              & "$env:ProgramFiles\Tailscale ailscale.exe" status
+            }
             
             # Continue anyway, as RDP might still work
             Write-Host "Proceeding despite test failure..."
@@ -320,10 +428,13 @@ jobs:
             
             # Periodically check Tailscale connection
             if ((Get-Date).Minute % 5 -eq 0) {
-              $tsStatus = & "$env:ProgramFiles\Tailscale ailscale.exe" status --json 2>$null | ConvertFrom-Json
-              if ($tsStatus.BackendState -ne "Running") {
-                Write-Host "Reconnecting Tailscale..."
-                & "$env:ProgramFiles\Tailscale ailscale.exe" up --reset
+              $tsExe = if ($env:TAILSCALE_EXE) { $env:TAILSCALE_EXE } else { "$env:ProgramFiles\Tailscale ailscale.exe" }
+              if (Test-Path $tsExe) {
+                $tsStatus = & $tsExe status --json 2>$null | ConvertFrom-Json
+                if ($tsStatus.BackendState -ne "Running") {
+                  Write-Host "Reconnecting Tailscale..."
+                  & $tsExe up --reset
+                }
               }
             }
             
