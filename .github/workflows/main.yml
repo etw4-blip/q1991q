@@ -28,7 +28,7 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "SecurityLayer" -Value 0 -Force
           
-          # Configure firewall - ALLOW ALL INCOMING on port 3389 (original behavior)
+          # Configure firewall - ALLOW ALL INCOMING on port 3389
           Write-Host "Configuring firewall rules..."
           
           # Remove existing RDP firewall rules to avoid conflicts
@@ -36,7 +36,7 @@ jobs:
           netsh advfirewall firewall delete rule name="RemoteDesktop" 2>$null
           netsh advfirewall firewall delete rule name="RDP-Debug" 2>$null
           
-          # Allow RDP from ANY source (original behavior)
+          # Allow RDP from ANY source
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in `
             action=allow `
@@ -72,7 +72,7 @@ jobs:
             Remove-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
           }
           
-          # Generate secure password (similar to original code)
+          # Generate secure password
           Add-Type -AssemblyName System.Security
           $charSet = @{
               Upper = [char[]](65..90) # A-Z
@@ -121,35 +121,54 @@ jobs:
           
           # Wait for installation
           Start-Sleep -Seconds 5
-          Write-Host "✅ Tailscale installed"
+          
+          # Verify installation
+          $tsPath = "$env:ProgramFiles\Tailscale ailscale.exe"
+          if (Test-Path $tsPath) {
+            Write-Host "✅ Tailscale installed successfully at $tsPath"
+          } else {
+            Write-Error "Tailscale installation failed - executable not found"
+            exit 1
+          }
 
       - name: Connect to Tailscale and Get IP
         id: tailscale
         run: |
+          # 修复路径问题 - 正确的Tailscale可执行文件路径
           $tsExe = "$env:ProgramFiles\Tailscale ailscale.exe"
           $hostname = "gh-runner-$env:GITHUB_RUN_ID"
           
-          # Wait for Tailscale service to be ready
-          $attempts = 0
-          while ($attempts -lt 10) {
-            if (Test-Path $tsExe) {
-              Write-Host "Tailscale executable found"
-              break
-            }
-            Write-Host "Waiting for Tailscale installation... ($attempts/10)"
-            Start-Sleep -Seconds 3
-            $attempts++
+          Write-Host "Tailscale executable path: $tsExe"
+          
+          # 检查Tailscale可执行文件是否存在
+          if (-not (Test-Path $tsExe)) {
+            Write-Error "Tailscale executable not found at $tsExe"
+            Write-Host "Checking Program Files directory..."
+            Get-ChildItem "$env:ProgramFiles\Tailscale" -ErrorAction SilentlyContinue
+            exit 1
           }
           
-          # Start Tailscale service
-          Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+          # 检查Tailscale服务
+          Write-Host "Checking Tailscale service..."
+          $service = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+          if ($service) {
+            Write-Host "Tailscale service status: $($service.Status)"
+            if ($service.Status -ne 'Running') {
+              Write-Host "Starting Tailscale service..."
+              Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+            }
+          } else {
+            Write-Host "Tailscale service not found, attempting to start manually..."
+            & $tsExe install-system-daemon 2>$null
+          }
+          
           Start-Sleep -Seconds 3
           
-          # Connect to Tailscale (using ORIGINAL method)
+          # Connect to Tailscale
           Write-Host "Connecting to Tailscale with hostname: $hostname"
           & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
           
-          # Get Tailscale IP (using ORIGINAL method)
+          # Get Tailscale IP
           $tsIP = $null
           $retries = 0
           
@@ -167,9 +186,13 @@ jobs:
           if (-not $tsIP) {
             # Try alternative method to get IP
             Write-Host "Trying alternative method to get IP..."
-            $status = & $tsExe status --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
-            if ($status -and $status.Self -and $status.Self.TailscaleIPs) {
-              $tsIP = $status.Self.TailscaleIPs | Where-Object { $_ -match '^100\.' } | Select-Object -First 1
+            try {
+              $status = & $tsExe status --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
+              if ($status -and $status.Self -and $status.Self.TailscaleIPs) {
+                $tsIP = $status.Self.TailscaleIPs | Where-Object { $_ -match '^100\.' } | Select-Object -First 1
+              }
+            } catch {
+              Write-Host "Could not parse JSON status"
             }
           }
           
@@ -177,12 +200,16 @@ jobs:
             echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
             Write-Host "✅ Tailscale IP: $tsIP"
             
-            # Also get public IP for verification
+            # 显示完整的Tailscale状态
+            Write-Host "Tailscale status:"
+            & $tsExe status
+            
+            # 尝试获取公共IP作为参考
             try {
-              $publicIP = (Invoke-WebRequest -Uri "https://api.ipify.org" -UseBasicParsing).Content
+              $publicIP = (Invoke-WebRequest -Uri "https://api.ipify.org" -UseBasicParsing -TimeoutSec 5).Content
               Write-Host "Public IP (for reference): $publicIP"
             } catch {
-              Write-Host "Could not get public IP"
+              Write-Host "Note: Could not get public IP (may be behind firewall)"
             }
           } else {
             Write-Error "❌ Failed to get Tailscale IP after $env:MAX_RETRIES attempts"
@@ -190,6 +217,8 @@ jobs:
             & $tsExe status
             Write-Host "Network adapters:"
             Get-NetAdapter | Format-Table Name, Status, InterfaceDescription
+            Write-Host "IP addresses:"
+            Get-NetIPAddress | Where-Object { $_.AddressFamily -eq 'IPv4' } | Format-Table InterfaceAlias, IPAddress
             exit 1
           }
 
@@ -285,7 +314,7 @@ jobs:
           Write-Host " User: $env:RDP_USERNAME"
           Write-Host ""
           
-          # Simple keep-alive loop (original behavior)
+          # Simple keep-alive loop
           while ($true) {
             Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP Active - IP: $env:TAILSCALE_IP"
             
