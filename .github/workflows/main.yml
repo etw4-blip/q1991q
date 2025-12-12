@@ -16,7 +16,7 @@ env:
 jobs:
   secure-rdp-session:
     runs-on: windows-latest
-    timeout-minutes: ${{ inputs.session_timeout }}
+    timeout-minutes: ${{ fromJSON(inputs.session_timeout) }}
 
     steps:
       - name: Check Session Timeout
@@ -24,6 +24,7 @@ jobs:
           $timeout = [int]${{ inputs.session_timeout }}
           if ($timeout -lt 10 -or $timeout -gt 360) {
             Write-Error "Timeout must be between 10 and 360 minutes"
+            Write-Output "::error::Session timeout must be between 10 and 360 minutes"
             exit 1
           }
           Write-Host "Session will timeout after $timeout minutes"
