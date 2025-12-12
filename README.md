@@ -1,0 +1,152 @@
+name: Secure Windows RDP via Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_timeout:
+        description: 'Session timeout in minutes (10-360)'
+        required: false
+        default: '120'
+        type: string
+
+env:
+  RDP_USERNAME: 'RDP-Admin'
+  TAILSCALE_VERSION: '1.82.0'
+
+jobs:
+  secure-rdp-session:
+    runs-on: windows-latest
+    timeout-minutes: ${{ inputs.session_timeout }}
+
+    steps:
+      - name: Check Session Timeout
+        run: |
+          $timeout = [int]${{ inputs.session_timeout }}
+          if ($timeout -lt 10 -or $timeout -gt 360) {
+            Write-Error "Timeout must be between 10 and 360 minutes"
+            exit 1
+          }
+          Write-Host "Session will timeout after $timeout minutes"
+
+      - name: Configure RDP
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Configure security settings
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 1 -Force
+          
+          # Configure firewall
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule `
+            name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+          
+          # Restart RDP service
+          Restart-Service -Name TermService -Force
+          
+          Write-Host "RDP configured successfully"
+
+      - name: Create RDP User
+        run: |
+          # Generate password
+          Add-Type -AssemblyName System.Web
+          $password = [System.Web.Security.Membership]::GeneratePassword(16, 4)
+          
+          # Mask password in logs
+          Write-Host "::add-mask::$password"
+          
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Create user
+          New-LocalUser -Name $env:RDP_USERNAME -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME
+          
+          # Store credentials
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          
+          Write-Host "User created: $env:RDP_USERNAME"
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$env:TAILSCALE_VERSION-amd64.msi"
+          $installerPath = "$env:TEMP ailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          
+          Remove-Item $installerPath -Force
+          
+          Write-Host "Tailscale installed"
+
+      - name: Connect Tailscale
+        run: |
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          
+          & "$env:ProgramFiles\Tailscale ailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
+          
+          # Wait for IP
+          $tsIP = $null
+          for ($i=1; $i -le 20; $i++) {
+              $tsIP = & "$env:ProgramFiles\Tailscale ailscale.exe" ip -4
+              if ($tsIP) { break }
+              Start-Sleep -Seconds 3
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Failed to get Tailscale IP"
+              exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $tsIP"
+
+      - name: Test RDP Connection
+        run: |
+          Write-Host "Testing connection to $env:TAILSCALE_IP..."
+          
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
+          if (-not $test) {
+              Write-Error "RDP connection failed"
+              exit 1
+          }
+          
+          Write-Host "Connection successful!"
+
+      - name: Display Connection Info
+        run: |
+          Write-Host "========================================"
+          Write-Host "RDP CONNECTION READY"
+          Write-Host "========================================"
+          Write-Host "IP Address: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "Port: 3389"
+          Write-Host "========================================"
+          Write-Host ""
+          Write-Host "Connect using: mstsc /v:$env:TAILSCALE_IP"
+          Write-Host ""
+
+      - name: Keep Alive
+        run: |
+          $startTime = Get-Date
+          $timeout = [int]${{ inputs.session_timeout }}
+          
+          while ($true) {
+              $elapsed = (Get-Date) - $startTime
+              $remaining = $timeout - [math]::Round($elapsed.TotalMinutes, 1)
+              
+              if ($remaining -le 0) {
+                  Write-Host "Session timeout reached"
+                  break
+              }
+              
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Active - $remaining minutes remaining"
+              Start-Sleep -Seconds 60
+          }
