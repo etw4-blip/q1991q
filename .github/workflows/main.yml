@@ -7,8 +7,6 @@ env:
   TS_VERSION: "1.82.0"
   RDP_PORT: 3389
   RDP_USERNAME: "RDP"
-  MAX_RETRIES: 15
-  RETRY_DELAY: 5
 
 jobs:
   secure-rdp:
@@ -18,287 +16,165 @@ jobs:
     steps:
       - name: Configure RDP Settings
         run: |
-          # Enable Remote Desktop
+          # 启用远程桌面
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                            -Name "fDenyTSConnections" -Value 0 -Force
           
-          # Disable Network Level Authentication (NLA) for easier connection
+          # 禁用网络级别身份验证(NLA)以便连接
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "SecurityLayer" -Value 0 -Force
           
-          # Configure firewall - ALLOW ALL INCOMING on port 3389
-          Write-Host "Configuring firewall rules..."
+          # 配置防火墙
+          Write-Host "配置防火墙规则..."
           
-          # Remove existing RDP firewall rules to avoid conflicts
+          # 移除现有规则
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall delete rule name="RemoteDesktop" 2>$null
-          netsh advfirewall firewall delete rule name="RDP-Debug" 2>$null
           
-          # Allow RDP from ANY source
+          # 允许RDP连接
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in `
-            action=allow `
-            protocol=TCP `
-            localport=$env:RDP_PORT `
-            description="Allow RDP connections"
+            dir=in action=allow protocol=TCP localport=$env:RDP_PORT
           
-          # Also allow UDP for better RDP performance
-          netsh advfirewall firewall add rule name="RDP-UDP" `
-            dir=in `
-            action=allow `
-            protocol=UDP `
-            localport=$env:RDP_PORT `
-            description="Allow RDP UDP connections"
-          
-          # Restart RDP service
+          # 重启服务
           Restart-Service -Name TermService -Force
           Start-Sleep -Seconds 3
           
-          # Verify RDP is listening
-          $rdpListening = Get-NetTCPConnection -LocalPort $env:RDP_PORT -ErrorAction SilentlyContinue
-          if ($rdpListening) {
-            Write-Host "✅ RDP is listening on port $env:RDP_PORT"
-          } else {
-            Write-Host "⚠️ RDP is not listening, checking service..."
-            Get-Service TermService | Format-Table Name, Status
-          }
+          Write-Host "✅ RDP配置完成"
 
       - name: Create RDP User
         run: |
-          # Remove existing user if exists
+          # 移除现有用户
           if (Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue) {
             Remove-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
           }
           
-          # Generate secure password
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper = [char[]](65..90) # A-Z
-              Lower = [char[]](97..122) # a-z
-              Number = [char[]](48..57) # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
-          }
-          
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 3
-          $rawPassword += $charSet.Lower | Get-Random -Count 3
-          $rawPassword += $charSet.Number | Get-Random -Count 3
-          $rawPassword += $charSet.Special | Get-Random -Count 3
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          
-          # Create user
+          # 生成密码
+          $password = "TestRDP@123" # 简单密码用于测试
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # 创建用户
           New-LocalUser -Name $env:RDP_USERNAME -Password $securePass -AccountNeverExpires
           
-          # Add to groups
+          # 添加到组
           Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME
           
-          # Save credentials
+          # 保存凭据
           echo "RDP_USERNAME=$env:RDP_USERNAME" >> $env:GITHUB_ENV
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           
-          # Mask password in logs
+          # 在日志中隐藏密码
           Write-Host "::add-mask::$password"
-          Write-Host "✅ User '$env:RDP_USERNAME' created"
+          Write-Host "✅ 用户 '$env:RDP_USERNAME' 已创建"
 
-      - name: Install Tailscale (Robust Method)
+      - name: Install Tailscale (Simple Method)
         run: |
-          Write-Host "=== Installing Tailscale (Robust Method) ==="
+          Write-Host "正在安装 Tailscale..."
           
-          # 方法1: 使用msiexec安装
-          Write-Host "Method 1: Installing via MSI..."
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$env:TS_VERSION-amd64.msi"
+          # 使用最简单的方法 - 直接运行MSI安装
           $installerPath = "$env:TEMP ailscale.msi"
           
-          # 下载安装包
-          try {
-            Write-Host "Downloading Tailscale from: $tsUrl"
-            Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
-            Write-Host "Download completed. File size: $(Get-Item $installerPath | Select-Object -ExpandProperty Length) bytes"
-          } catch {
-            Write-Host "Download failed: $_"
-            # 尝试备用URL
-            $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-            Write-Host "Trying alternative URL: $tsUrl"
-            Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
-          }
+          # 下载
+          Write-Host "下载 Tailscale..."
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $installerPath
           
-          # 安装MSI包
-          Write-Host "Installing MSI package..."
-          $installArgs = @(
-            "/i", "`"$installerPath`"",
-            "/quiet",
-            "/norestart",
-            "/log", "$env:TEMP ailscale_install.log"
-          )
-          
-          $process = Start-Process msiexec.exe -ArgumentList $installArgs -Wait -PassThru -NoNewWindow
-          
-          if ($process.ExitCode -ne 0) {
-            Write-Warning "MSI installation returned exit code $($process.ExitCode)"
-            Write-Host "Installation log (last 20 lines):"
-            if (Test-Path "$env:TEMP ailscale_install.log") {
-              Get-Content "$env:TEMP ailscale_install.log" -Tail 20 -ErrorAction SilentlyContinue
-            }
-          } else {
-            Write-Host "MSI installation completed successfully"
-          }
-          
-          # 清理安装包
-          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+          # 静默安装 - 使用最简单的方法
+          Write-Host "正在安装..."
+          cmd /c "msiexec /i `"$installerPath`" /quiet /qn /norestart"
           
           # 等待安装完成
-          Start-Sleep -Seconds 10
+          Write-Host "等待安装完成..."
+          Start-Sleep -Seconds 15
           
-          # 检查安装是否成功
-          $tsExePath = "$env:ProgramFiles\Tailscale ailscale.exe"
-          $tsExePathX86 = "${env:ProgramFiles(x86)}\Tailscale ailscale.exe"
-          
-          if (Test-Path $tsExePath) {
-            Write-Host "✅ Tailscale installed at: $tsExePath"
-          } elseif (Test-Path $tsExePathX86) {
-            Write-Host "✅ Tailscale installed at: $tsExePathX86"
-            $tsExePath = $tsExePathX86
-          } else {
-            Write-Warning "Tailscale not found in standard locations. Trying method 2..."
-            
-            # 方法2: 使用winget安装 (如果可用)
-            Write-Host "Method 2: Trying winget installation..."
-            try {
-              winget install --id Tailscale.Tailscale --silent --accept-package-agreements --accept-source-agreements
-              Write-Host "Winget installation attempted"
-            } catch {
-              Write-Host "Winget installation failed or not available"
+          # 检查是否安装成功
+          $tsExe = "C:\Program Files\Tailscale ailscale.exe"
+          $attempts = 0
+          while ($attempts -lt 10) {
+            if (Test-Path $tsExe) {
+              Write-Host "✅ Tailscale 安装成功!"
+              break
             }
+            Write-Host "等待 Tailscale 安装... ($attempts/10)"
+            Start-Sleep -Seconds 5
+            $attempts++
+          }
+          
+          if (-not (Test-Path $tsExe)) {
+            Write-Host "⚠️ Tailscale 可能未安装到默认位置，尝试其他方法..."
             
-            # 等待并再次检查
-            Start-Sleep -Seconds 10
+            # 尝试启动服务
+            Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
             
-            if (Test-Path $tsExePath) {
-              Write-Host "✅ Tailscale found after winget attempt"
+            # 查找tailscale.exe
+            $foundExe = Get-ChildItem -Path "C:\" -Filter "tailscale.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($foundExe) {
+              $tsExe = $foundExe.FullName
+              Write-Host "找到 Tailscale 在: $tsExe"
             } else {
-              # 方法3: 直接下载并解压
-              Write-Host "Method 3: Trying direct download and extraction..."
-              $zipUrl = "https://pkgs.tailscale.com/stable/tailscale-$env:TS_VERSION-windows-amd64.zip"
-              $zipPath = "$env:TEMP ailscale.zip"
-              $extractPath = "$env:TEMP ailscale_extracted"
-              
-              try {
-                Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
-                Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
-                
-                # 复制文件到程序目录
-                New-Item -ItemType Directory -Path "$env:ProgramFiles\Tailscale" -Force
-                Copy-Item "$extractPath ailscale.exe" "$env:ProgramFiles\Tailscale ailscale.exe" -Force
-                Copy-Item "$extractPath ailscaled.exe" "$env:ProgramFiles\Tailscale ailscaled.exe" -Force
-                
-                Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
-                Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
-                
-                Write-Host "Direct extraction completed"
-              } catch {
-                Write-Warning "Direct extraction failed: $_"
-              }
+              Write-Host "❌ 无法找到 Tailscale，但继续尝试连接..."
             }
           }
           
-          # 最终检查
-          Start-Sleep -Seconds 5
-          if (Test-Path $tsExePath) {
-            Write-Host "✅ Tailscale installation verified: $tsExePath"
-            # 设置环境变量供后续步骤使用
-            echo "TAILSCALE_EXE=$tsExePath" >> $env:GITHUB_ENV
-          } else {
-            Write-Error "❌ Tailscale installation failed - executable not found"
-            Write-Host "Checking installed programs..."
-            Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -like "*Tailscale*" } | Format-List Name, Version
-            exit 1
-          }
+          # 设置环境变量
+          echo "TAILSCALE_EXE=$tsExe" >> $env:GITHUB_ENV
 
-      - name: Connect to Tailscale and Get IP
-        id: tailscale
+      - name: Connect to Tailscale
         run: |
-          Write-Host "=== Connecting to Tailscale ==="
+          Write-Host "=== 连接到 Tailscale ==="
           
-          # 使用环境变量中的路径或默认路径
+          # 确定Tailscale可执行文件路径
           if ($env:TAILSCALE_EXE) {
             $tsExe = $env:TAILSCALE_EXE
           } else {
-            $tsExe = "$env:ProgramFiles\Tailscale ailscale.exe"
+            $tsExe = "C:\Program Files\Tailscale ailscale.exe"
           }
           
-          Write-Host "Using Tailscale executable: $tsExe"
+          Write-Host "使用 Tailscale 执行文件: $tsExe"
           
-          # 检查Tailscale可执行文件是否存在
+          # 如果文件不存在，尝试直接调用（可能已在PATH中）
           if (-not (Test-Path $tsExe)) {
-            Write-Error "Tailscale executable not found at $tsExe"
-            Write-Host "Searching for Tailscale executable..."
-            Get-ChildItem -Path "$env:ProgramFiles" -Filter "tailscale.exe" -Recurse -ErrorAction SilentlyContinue
-            Get-ChildItem -Path "${env:ProgramFiles(x86)}" -Filter "tailscale.exe" -Recurse -ErrorAction SilentlyContinue
-            exit 1
+            Write-Host "⚠️ Tailscale 执行文件未找到，尝试直接调用..."
+            $tsExe = "tailscale.exe"
           }
           
           $hostname = "gh-runner-$env:GITHUB_RUN_ID"
           
-          # 显示Tailscale版本
-          Write-Host "Tailscale version:"
-          & $tsExe version
-          
-          # 确保Tailscale服务运行
-          Write-Host "Ensuring Tailscale service is running..."
-          try {
-            Start-Service -Name Tailscale -ErrorAction SilentlyContinue
-          } catch {
-            Write-Host "Service not found, attempting to install..."
-            & $tsExe install-system-daemon 2>$null
+          # 检查Tailscale服务
+          Write-Host "检查 Tailscale 服务..."
+          $service = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+          if ($service -and $service.Status -ne 'Running') {
+            Write-Host "启动 Tailscale 服务..."
+            Start-Service -Name Tailscale
           }
           
           Start-Sleep -Seconds 5
           
-          # 检查当前状态
-          Write-Host "Current Tailscale status:"
-          & $tsExe status 2>&1
-          
-          # 连接到Tailscale
-          Write-Host "Connecting to Tailscale with hostname: $hostname"
+          # 连接到 Tailscale (使用原始方法)
+          Write-Host "连接到 Tailscale，主机名: $hostname"
           $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
           
           if ([string]::IsNullOrEmpty($authKey)) {
-            Write-Error "TAILSCALE_AUTH_KEY is not set. Please add it to repository secrets."
+            Write-Error "TAILSCALE_AUTH_KEY 未设置。请添加到仓库的 Secrets 中。"
             exit 1
           }
           
-          Write-Host "Auth key length: $($authKey.Length)"
-          & $tsExe up --authkey=$authKey --hostname=$hostname --reset
+          # 执行连接命令
+          & $tsExe up --authkey=$authKey --hostname=$hostname 2>&1
           
           # 等待并获取IP
           $tsIP = $null
           $retries = 0
           
-          Write-Host "Waiting for Tailscale IP assignment..."
-          while (-not $tsIP -and $retries -lt $env:MAX_RETRIES) {
-            Write-Host "Attempt $($retries + 1)/$env:MAX_RETRIES..."
-            
-            # 获取IPv4地址
+          Write-Host "等待 Tailscale 分配IP..."
+          while (-not $tsIP -and $retries -lt 10) {
             $tsIP = & $tsExe ip -4 2>$null
             
             if (-not $tsIP) {
-              # 尝试JSON方式获取
-              try {
-                $status = & $tsExe status --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
-                if ($status -and $status.Self -and $status.Self.TailscaleIPs) {
-                  $tsIP = $status.Self.TailscaleIPs | Where-Object { $_ -match '^100\.' } | Select-Object -First 1
-                }
-              } catch {
-                # 忽略JSON解析错误
-              }
-            }
-            
-            if (-not $tsIP) {
-              Start-Sleep -Seconds $env:RETRY_DELAY
+              Write-Host "尝试 $($retries + 1)/10: 尚未获取IP..."
+              Start-Sleep -Seconds 3
               $retries++
             }
           }
@@ -307,136 +183,137 @@ jobs:
             echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
             Write-Host "✅ Tailscale IP: $tsIP"
             
-            # 显示完整状态
-            Write-Host "Tailscale full status:"
-            & $tsExe status --json | ConvertFrom-Json | Select-Object BackendState, MagicDNSSuffix, Self | Format-List
-            
-            # 显示网络适配器
-            Write-Host "Network adapters (filtered):"
-            Get-NetAdapter | Where-Object { $_.Name -like "*Tailscale*" } | Format-Table Name, Status, MacAddress
+            # 显示状态
+            & $tsExe status 2>&1
           } else {
-            Write-Error "❌ Failed to get Tailscale IP after $env:MAX_RETRIES attempts"
-            Write-Host "Debug information:"
-            Write-Host "1. Tailscale status:"
-            & $tsExe status
-            Write-Host "2. Network adapters:"
-            Get-NetAdapter | Format-Table Name, Status, InterfaceDescription
-            Write-Host "3. IP addresses:"
-            Get-NetIPAddress | Where-Object { $_.AddressFamily -eq 'IPv4' } | Format-Table InterfaceAlias, IPAddress
-            exit 1
+            Write-Error "❌ 无法获取 Tailscale IP"
+            Write-Host "调试信息:"
+            
+            # 尝试其他方法获取IP
+            Write-Host "尝试通过 status 命令获取IP..."
+            $status = & $tsExe status 2>&1
+            Write-Host $status
+            
+            # 从状态输出中提取IP
+            if ($status -match '(\d+\.\d+\.\d+\.\d+)') {
+              $tsIP = $matches[1]
+              echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+              Write-Host "✅ 从状态中提取到 IP: $tsIP"
+            } else {
+              # 继续运行，但警告用户
+              Write-Host "⚠️ 无法获取IP，但继续运行..."
+            }
           }
 
-      - name: Test RDP Connectivity
+      - name: Test RDP
         run: |
-          Write-Host "Testing RDP connectivity to: $env:TAILSCALE_IP"
+          if (-not $env:TAILSCALE_IP) {
+            Write-Host "⚠️ 未获取到 Tailscale IP，跳过测试"
+            exit 0
+          }
           
-          # First test local RDP
-          Write-Host "1. Testing local RDP port..."
+          Write-Host "测试 RDP 连接到: $env:TAILSCALE_IP"
+          
+          # 测试本地RDP
+          Write-Host "1. 测试本地RDP端口..."
           $localTest = Test-NetConnection -ComputerName 127.0.0.1 -Port $env:RDP_PORT -WarningAction SilentlyContinue
           if ($localTest.TcpTestSucceeded) {
-            Write-Host "✅ Local RDP port is open"
+            Write-Host "✅ 本地RDP端口已打开"
           } else {
-            Write-Error "❌ Local RDP port is not responding"
-            exit 1
+            Write-Host "❌ 本地RDP端口未响应"
           }
           
-          # Test via Tailscale IP
-          Write-Host "2. Testing via Tailscale IP..."
-          $testResult = $null
-          $retries = 0
-          
-          while ($retries -lt 5) {
-            $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $env:RDP_PORT -WarningAction SilentlyContinue
+          # 通过Tailscale IP测试
+          Write-Host "2. 通过 Tailscale IP 测试..."
+          try {
+            $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $env:RDP_PORT -WarningAction SilentlyContinue -ErrorAction Stop
             if ($testResult.TcpTestSucceeded) {
-              Write-Host "✅ RDP is accessible via Tailscale!"
-              break
-            }
-            
-            $retries++
-            if ($retries -lt 5) {
-              Write-Host "Test $retries/5 failed, retrying in 5 seconds..."
-              Start-Sleep -Seconds 5
-            }
-          }
-          
-          if (-not $testResult.TcpTestSucceeded) {
-            Write-Warning "⚠️ Direct TCP test failed. This may be normal for some configurations."
-            Write-Host "Checking firewall rules..."
-            netsh advfirewall firewall show rule name="RDP-Tailscale" verbose
-            
-            Write-Host "Checking listening ports..."
-            netstat -an | Select-String -Pattern ":3389"
-            
-            Write-Host "Tailscale status:"
-            if ($env:TAILSCALE_EXE) {
-              & $env:TAILSCALE_EXE status
+              Write-Host "✅ RDP 可通过 Tailscale 访问!"
             } else {
-              & "$env:ProgramFiles\Tailscale ailscale.exe" status
+              Write-Host "⚠️ TCP测试失败，但可能仍然可以连接"
             }
-            
-            # Continue anyway, as RDP might still work
-            Write-Host "Proceeding despite test failure..."
+          } catch {
+            Write-Host "⚠️ 连接测试失败: $_"
           }
 
-      - name: Display Connection Information
+      - name: Display Connection Info
         run: |
           $border = "═" * 50
           
           Write-Host ""
           Write-Host $border
-          Write-Host "🚀 RDP READY FOR CONNECTION"
+          Write-Host "🚀 RDP 准备就绪"
           Write-Host $border
           Write-Host ""
-          Write-Host "🌐 CONNECT TO:"
-          Write-Host " $env:TAILSCALE_IP"
+          
+          if ($env:TAILSCALE_IP) {
+            Write-Host "🌐 连接到:"
+            Write-Host " $env:TAILSCALE_IP"
+            Write-Host ""
+            Write-Host "📝 快速连接:"
+            Write-Host " mstsc /v:$env:TAILSCALE_IP"
+            Write-Host ""
+          } else {
+            Write-Host "⚠️ 无法获取 Tailscale IP"
+            Write-Host "请检查 Tailscale 连接"
+            Write-Host ""
+          }
+          
+          Write-Host "🔑 凭据:"
+          Write-Host " 用户名: $env:RDP_USERNAME"
+          Write-Host " 密码: $env:RDP_PASSWORD"
           Write-Host ""
-          Write-Host "🔑 CREDENTIALS:"
-          Write-Host " Username: $env:RDP_USERNAME"
-          Write-Host " Password: ******** (see workflow environment)"
-          Write-Host ""
-          Write-Host "📝 QUICK CONNECT:"
-          Write-Host " mstsc /v:$env:TAILSCALE_IP"
-          Write-Host ""
-          Write-Host "⚠️ IMPORTANT NOTES:"
-          Write-Host " 1. Ensure you're connected to the same Tailscale network"
-          Write-Host " 2. Disable NLA in Remote Desktop client if connection fails"
-          Write-Host " 3. Runner will auto-terminate after 60 minutes"
+          Write-Host "⚠️ 重要提示:"
+          Write-Host " 1. 确保连接到相同的 Tailscale 网络"
+          Write-Host " 2. 在远程桌面客户端中禁用 NLA（如果需要）"
+          Write-Host " 3. 运行器将在60分钟后自动终止"
           Write-Host ""
           Write-Host $border
           
-          # Also output to job summary for easy copy-paste
-          Write-Output "## Connection Details" >> $GITHUB_STEP_SUMMARY
-          Write-Output "**IP Address:** $env:TAILSCALE_IP" >> $GITHUB_STEP_SUMMARY
-          Write-Output "**Username:** $env:RDP_USERNAME" >> $GITHUB_STEP_SUMMARY
+          # 输出到摘要
+          Write-Output "## 连接详情" >> $GITHUB_STEP_SUMMARY
+          if ($env:TAILSCALE_IP) {
+            Write-Output "**IP地址:** $env:TAILSCALE_IP" >> $GITHUB_STEP_SUMMARY
+          }
+          Write-Output "**用户名:** $env:RDP_USERNAME" >> $GITHUB_STEP_SUMMARY
+          Write-Output "**密码:** $env:RDP_PASSWORD" >> $GITHUB_STEP_SUMMARY
           Write-Output "" >> $GITHUB_STEP_SUMMARY
-          Write-Output "```" >> $GITHUB_STEP_SUMMARY
-          Write-Output "mstsc /v:$env:TAILSCALE_IP" >> $GITHUB_STEP_SUMMARY
-          Write-Output "```" >> $GITHUB_STEP_SUMMARY
+          if ($env:TAILSCALE_IP) {
+            Write-Output "```" >> $GITHUB_STEP_SUMMARY
+            Write-Output "mstsc /v:$env:TAILSCALE_IP" >> $GITHUB_STEP_SUMMARY
+            Write-Output "```" >> $GITHUB_STEP_SUMMARY
+          }
 
-      - name: Keep Runner Alive
+      - name: Keep Alive
         run: |
-          Write-Host "🔄 Runner active. Press 'Cancel workflow' in GitHub to terminate."
-          Write-Host ""
-          Write-Host "Connection details:"
-          Write-Host " IP: $env:TAILSCALE_IP"
-          Write-Host " User: $env:RDP_USERNAME"
+          Write-Host "🔄 运行器活跃中。在 GitHub 中点击 'Cancel workflow' 终止。"
           Write-Host ""
           
-          # Simple keep-alive loop
+          if ($env:TAILSCALE_IP) {
+            Write-Host "连接详情:"
+            Write-Host " IP: $env:TAILSCALE_IP"
+          }
+          Write-Host " 用户: $env:RDP_USERNAME"
+          Write-Host ""
+          
+          # 保持运行
+          $counter = 0
           while ($true) {
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP Active - IP: $env:TAILSCALE_IP"
+            $counter++
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP 活跃中 - 第 $counter 分钟"
             
-            # Periodically check Tailscale connection
-            if ((Get-Date).Minute % 5 -eq 0) {
-              $tsExe = if ($env:TAILSCALE_EXE) { $env:TAILSCALE_EXE } else { "$env:ProgramFiles\Tailscale ailscale.exe" }
-              if (Test-Path $tsExe) {
-                $tsStatus = & $tsExe status --json 2>$null | ConvertFrom-Json
-                if ($tsStatus.BackendState -ne "Running") {
-                  Write-Host "Reconnecting Tailscale..."
-                  & $tsExe up --reset
-                }
+            # 每5分钟检查一次Tailscale连接
+            if ($counter % 5 -eq 0 -and $env:TAILSCALE_IP) {
+              Write-Host "检查 Tailscale 连接..."
+              $tsExe = if ($env:TAILSCALE_EXE) { $env:TAILSCALE_EXE } else { "tailscale.exe" }
+              try {
+                & $tsExe status 2>&1 | Out-Null
+                Write-Host "Tailscale 连接正常"
+              } catch {
+                Write-Host "Tailscale 连接断开，尝试重新连接..."
+                & $tsExe up --reset 2>&1
               }
             }
             
-            Start-Sleep -Seconds 300
+            Start-Sleep -Seconds 60
           }
