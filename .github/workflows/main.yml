@@ -11,8 +11,17 @@ jobs:
       RDP_USERNAME: RDP
 
     steps:
+      - name: 🛠️ Fix Encoding & Set UTF-8
+        run: |
+          # 防止中文乱码，确保后续脚本输出正常
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          chcp 65001
+        shell: powershell
+
       - name: 🔧 Enable Remote Desktop
         run: |
+          Write-Host "🔄 开启远程桌面服务..." -ForegroundColor Yellow
+          
           # 1. 启用远程桌面并关闭网络级身份验证
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
@@ -26,51 +35,40 @@ jobs:
           Restart-Service -Name TermService -Force
         shell: powershell
 
-      - name: 🔐 Generate Secure Password (Fully Fixed)
+      - name: 🔐 Generate Secure Password
         id: password
         run: |
-          # -----------------------------------------------------------
-          # 定义字符集 (使用最基础的数组语法，避免解析错误)
-          # -----------------------------------------------------------
-          
-          # 大写字母 A-Z (ASCII 65-90)
-          $upper = 65..90 | ForEach-Object { [char]$_ }
-          
-          # 小写字母 a-z (ASCII 97-122)
-          $lower = 97..122 | ForEach-Object { [char]$_ }
-          
-          # 数字 0-9 (ASCII 48-57)
-          $number = 48..57 | ForEach-Object { [char]$_ }
-          
-          # 特殊字符 (手动列出所有 ASCII 码，绝对安全)
+          Write-Host "🔑 生成高强度密码..." -ForegroundColor Yellow
+
+          # 定义字符集 (使用最安全的数组定义方式)
+          $upper = 65..90 | ForEach-Object { [char]$_ } # A-Z
+          $lower = 97..122 | ForEach-Object { [char]$_ } # a-z
+          $number = 48..57 | ForEach-Object { [char]$_ } # 0-9
+          # 特殊字符：!#$%&*+-./:;<=>?@[]^_`{|}~
           $special = 33,35,36,37,38,42,43,45,46,47,58,59,60,61,62,63,64,91,92,93,94,95,96,123,124,125,126 | ForEach-Object { [char]$_ }
 
-          # 合并所有字符
+          # 合并并随机打乱生成16位密码
           $allChars = $upper + $lower + $number + $special
-
-          # -----------------------------------------------------------
-          # 生成 16 位随机密码
-          # -----------------------------------------------------------
           $password = -join ($allChars | Get-Random -Count 16)
 
-          # -----------------------------------------------------------
-          # 输出并保护密码
-          # -----------------------------------------------------------
+          # 屏蔽密码防止泄露
           Write-Host "::add-mask::$password"
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
         shell: powershell
 
       - name: 👤 Create User Account
         run: |
+          Write-Host "➕ 创建用户 $env:RDP_USERNAME ..." -ForegroundColor Yellow
+          
           $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
           $username = "$"
 
-          # 清理旧用户 (如果存在)
+          # 如果用户已存在则删除
           if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
             Remove-LocalUser -Name $username
           }
 
-          # 创建新用户并提权
+          # 创建用户并加入管理员组
           New-LocalUser -Name $username -Password $securePass -FullName "RDP User" -Description "Auto-created RDP account" -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member $username
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
@@ -78,6 +76,8 @@ jobs:
 
       - name: 📦 Install Tailscale
         run: |
+          Write-Host "📦 安装 Tailscale ..." -ForegroundColor Yellow
+          
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP ailscale.msi"
           
@@ -93,33 +93,40 @@ jobs:
 
       - name: 🌐 Connect to Tailscale
         run: |
-          $tailscale = "$env:ProgramFiles\Tailscale ailscale.exe"
-          if (-not (Test-Path $tailscale)) {
-            Write-Error "未找到 Tailscale"
+          Write-Host "🔗 连接 Tailscale 网络..." -ForegroundColor Yellow
+          
+          # 修复路径拼接：使用 Combine 避免路径错误
+          $tailscaleExe = [System.IO.Path]::Combine($env:ProgramFiles, "Tailscale", "tailscale.exe")
+          
+          # 检查文件是否存在
+          if (-not (Test-Path $tailscaleExe)) {
+            Write-Error "❌ 未找到 Tailscale 客户端，请检查安装步骤。"
             exit 1
           }
 
           # 连接节点
-          & $tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-${{ github.run_id }}
+          & $tailscaleExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-${{ github.run_id }}
           
           # 获取 IP 地址
-          $ip = & $tailscale ip -4 2>$null
+          $ip = & $tailscaleExe ip -4 2>$null
           if (-not $ip) {
-            Write-Error "无法获取 IP"
+            Write-Error "❌ 无法获取 Tailscale IP"
             exit 1
           }
 
           echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-          Write-Host "连接成功，IP: $ip"
+          Write-Host "✅ Tailscale 连接成功，IP: $ip" -ForegroundColor Green
         shell: powershell
 
       - name: 🖥️ Connection Info & Keep Alive
         run: |
           Write-Host "====================================" -ForegroundColor Green
-          Write-Host "✅ 准备就绪! 请使用以下信息连接" -ForegroundColor Green
+          Write-Host "🎉 准备就绪! 请使用以下信息连接" -ForegroundColor Green
           Write-Host "地址: $env:TAILSCALE_IP"
           Write-Host "用户名: $env:RDP_USERNAME"
           Write-Host "密码: $env:RDP_PASSWORD" # 会被掩码
           Write-Host "====================================" -ForegroundColor Green
 
           # 保持运行
+          while ($true) {
+            Write-Host "[$(Get-Date)] ⏳ 会话保持运行中... (在 GitHub 上点击 'Cancel' 以结束会话)"
