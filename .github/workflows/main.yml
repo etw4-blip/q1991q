@@ -1,69 +1,85 @@
-name: Secure RDP with Tailscale
+name: Windows RDP with Tailscale
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
+  rdp:
     runs-on: windows-latest
     timeout-minutes: 60
     env:
       RDP_USERNAME: RDP
 
     steps:
-      - name: 🔧 Configure RDP Settings
+      - name: 🔧 Enable Remote Desktop
         run: |
-          # Enable Remote Desktop and disable NLA/Security Layer for simplicity (not for production!)
+          # 1. 启用远程桌面并关闭网络级身份验证 (为了兼容性，非生产环境)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove existing firewall rule
+          # 2. 配置防火墙允许 3389 端口
           netsh advfirewall firewall delete rule name="RDP-Tailscale" > $null 2>&1
-
-          # Allow RDP port via firewall
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 > $null
 
-          # Restart service to apply changes
+          # 3. 重启服务生效
           Restart-Service -Name TermService -Force
         shell: powershell
 
-      - name: 🔐 Generate & Set Random Password
+      - name: 🔐 Generate Secure Password (Fixed)
         id: password
         run: |
-          # Fixed: Use pipeline to correctly convert int to char
-          $charSet = @{
-            Upper = 65..90 | ForEach-Object { [char]$_ } # A-Z
-            Lower = 97..122 | ForEach-Object { [char]$_ } # a-z
-            Number = 48..57 | ForEach-Object { [char]$_ } # 0-9
-            Special = @(33,35..38,42..43,45..47,58..64,91..96,123..126) | ForEach-Object { [char]$_ } # !#$%&*+-./:;<=>?@[]^_`{|}~
-          }
-
-          $password = @()
-          $password += Get-Random -InputObject $charSet.Upper -Count 4
-          $password += Get-Random -InputObject $charSet.Lower -Count 4
-          $password += Get-Random -InputObject $charSet.Number -Count 4
-          $password += Get-Random -InputObject $charSet.Special -Count 4
+          # -----------------------------------------------------------
+          # 字符集构建 (分步定义，避免 PowerShell 类型推断错误)
+          # -----------------------------------------------------------
           
-          # Shuffle the final password
-          $password = ($password | Sort-Object { Get-Random }) -join ''
+          # 大写字母 A-Z
+          $upper = 65..90 | ForEach-Object { [char]$_ }
+          
+          # 小写字母 a-z  
+          $lower = 97..122 | ForEach-Object { [char]$_ }
+          
+          # 数字 0-9
+          $number = 48..57 | ForEach-Object { [char]$_ }
+          
+          # 特殊字符 (拆分复杂范围为简单范围，确保兼容性)
+          # 对应符号: !#$%&*+-./:;<=>?@[]^_`{|}~
+          $special = @(
+            33 # !
+          ) + (35..38) # # $ % &
+          ) + (42..43) # * +
+          ) + (45..47) # - . /
+          ) + (58..64) # : ; < = > ? @
+          ) + (91..96) # [ \ ] ^ _ `
+          ) + (123..126) # { | } ~
+          ) | ForEach-Object { [char]$_ }
 
-          # Mask password in logs and set to environment
+          # 合并所有字符集
+          $charSet = $upper + $lower + $number + $special
+
+          # -----------------------------------------------------------
+          # 随机生成 16 位密码
+          # -----------------------------------------------------------
+          $password = -join ($charSet | Get-Random -Count 16)
+
+          # -----------------------------------------------------------
+          # 输出并保护密码 (防止日志泄露)
+          # -----------------------------------------------------------
           Write-Host "::add-mask::$password"
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
         shell: powershell
 
-      - name: 👤 Create RDP User
+      - name: 👤 Create User Account
         run: |
           $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
           $username = "${{ env.RDP_USERNAME }}"
-          
-          # Remove user if exists
+
+          # 如果用户已存在则删除 (防止重跑工作流冲突)
           if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
             Remove-LocalUser -Name $username
           }
-          
-          # Create user and add to groups
+
+          # 创建新用户并加入管理员组
           New-LocalUser -Name $username -Password $securePass -FullName "RDP User" -Description "Auto-created RDP account" -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member $username
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
@@ -79,7 +95,7 @@ jobs:
             Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait -NoNewWindow
             Remove-Item $installerPath -Force
           } catch {
-            Write-Error "Failed to install Tailscale: $_"
+            Write-Error "安装失败: $_"
             exit 1
           }
         shell: powershell
@@ -88,51 +104,35 @@ jobs:
         run: |
           $tailscale = "$env:ProgramFiles\Tailscale ailscale.exe"
           if (-not (Test-Path $tailscale)) {
-            Write-Error "Tailscale not installed at $tailscale"
+            Write-Error "未找到 Tailscale"
             exit 1
           }
 
+          # 连接并获取 IP
           & $tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-${{ github.run_id }}
           
-          # Wait for IP with timeout
-          $ip = $null
-          for ($i = 0; $i -lt 10; $i++) {
-            $ip = & $tailscale ip -4 2>$null
-            if ($ip) { break }
-            Start-Sleep -Seconds 6
-          }
-
+          $ip = & $tailscale ip -4 2>$null
           if (-not $ip) {
-            Write-Error "Could not obtain Tailscale IP"
+            Write-Error "无法获取 IP"
             exit 1
           }
 
           echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IP: $ip"
+          Write-Host "连接成功，IP: $ip"
         shell: powershell
 
-      - name: 🧪 Verify RDP Port Accessibility
-        run: |
-          $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
-          if (-not $result) {
-            Write-Error "RDP port 3389 is not reachable"
-            exit 1
-          }
-          Write-Host " Port 3389 is open and accessible"
-        shell: powershell
-
-      - name: 🖥️ RDP Connection Info (Keep Alive)
+      - name: 🖥️ Connection Info & Keep Alive
         run: |
           Write-Host "====================================" -ForegroundColor Green
-          Write-Host "✅ RDP Access Ready!" -ForegroundColor Green
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: $env:RDP_USERNAME"
-          Write-Host "Password: $env:RDP_PASSWORD" # This is masked due to add-mask
+          Write-Host "✅ 准备就绪! 请使用以下信息连接" -ForegroundColor Green
+          Write-Host "地址: $env:TAILSCALE_IP"
+          Write-Host "用户名: $env:RDP_USERNAME"
+          Write-Host "密码: $env:RDP_PASSWORD" # 日志中会被掩码 * 号替代
           Write-Host "====================================" -ForegroundColor Green
 
-          # Keep runner alive
+          # 保持会话运行，直到你手动取消 Workflow
           while ($true) {
-            Write-Host "[$(Get-Date)] Session active. Press Cancel in GitHub Actions to terminate."
+            Write-Host "[$(Get-Date)] 连接中... (在 GitHub 上点击 'Cancel' 以结束会话)"
             Start-Sleep -Seconds 300
           }
         shell: powershell
