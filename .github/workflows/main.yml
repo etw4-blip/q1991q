@@ -23,12 +23,12 @@ jobs:
         run: |
           Write-Host "[Step 1/6] Enabling Remote Desktop..." -ForegroundColor Yellow
           
-          # 1. 启用远程桌面
+          # 1. 启用远程桌面并关闭网络级身份验证
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
 
-          # 2. 防火墙
+          # 2. 配置防火墙
           netsh advfirewall firewall delete rule name="RDP-Tailscale" > $null 2>&1
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 > $null
 
@@ -96,25 +96,44 @@ jobs:
           $tailscaleExe = [System.IO.Path]::Combine($env:ProgramFiles, "Tailscale", "tailscale.exe")
           
           if (-not (Test-Path $tailscaleExe)) {
-            Write-Error "Tailscale not found!"
+            Write-Error " Tailscale not found!"
             exit 1
           }
 
-          & $tailscaleExe up --authkey=$ --hostname=gh-runner-${{ github.run_id }}
-          $ip = & $tailscaleExe ip -4 2>$null
+          # -----------------------------------------------------------
+          # 增加重试机制和状态检查
+          # -----------------------------------------------------------
+          Write-Host "🔗 Connecting..."
+          & $tailscaleExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-${{ github.run_id }} --accept-routes --accept-dns=false
+
+          # 等待连接初始化
+          Start-Sleep -Seconds 5
+
+          $maxRetries = 10
+          $ip = $null
+          for ($i = 0; $i -lt $maxRetries; $i++) {
+            $ip = & $tailscaleExe ip -4 2>$null
+            if ($ip) { 
+              Write-Host "✅ Got IP: $ip"
+              break 
+            }
+            Write-Host "⏳ Waiting for IP... ($($i+1)/$maxRetries)"
+            Start-Sleep -Seconds 3
+          }
+
           if (-not $ip) {
-            Write-Error "No IP obtained!"
+            Write-Error " Failed to get IP. Current status:"
+            & $tailscaleExe status
             exit 1
           }
 
           echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-          Write-Host "Connected. IP: $ip"
         shell: powershell
 
       - name: 🖥️ Connection Info & Keep Alive
         run: |
           Write-Host "====================================" -ForegroundColor Green
-          Write-Host "READY! Connect using the info below:" -ForegroundColor Green
+          Write-Host "🎉 READY! Connect using the info below:" -ForegroundColor Green
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: $env:RDP_USERNAME"
           Write-Host "Password: $env:RDP_PASSWORD"
