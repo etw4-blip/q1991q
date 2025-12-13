@@ -1,132 +1,236 @@
-name: Windows RDP with Tailscale
+name: RDP via Tailscale
 
 on:
   workflow_dispatch:
 
-jobs:
-  rdp:
-    runs-on: windows-latest
-    timeout-minutes: 60
-    env:
-      RDP_USERNAME: RDP
-
-    steps:
-      - name: 🛠️ Fix Encoding & Set UTF-8
+env:
+      - name: Install Tailscale via Winget
         run: |
-          # 防止中文乱码，确保后续脚本输出正常
-          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          chcp 65001
-        shell: powershell
-
-      - name: 🔧 Enable Remote Desktop
-        run: |
-          Write-Host "🔄 开启远程桌面服务..." -ForegroundColor Yellow
+          Write-Host "=== Installing Tailscale via Winget ==="
           
-          # 1. 启用远程桌面并关闭网络级身份验证
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-
-          # 2. 配置防火墙
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" > $null 2>&1
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 > $null
-
-          # 3. 重启服务
-          Restart-Service -Name TermService -Force
-        shell: powershell
-
-      - name: 🔐 Generate Secure Password
-        id: password
-        run: |
-          Write-Host "🔑 生成高强度密码..." -ForegroundColor Yellow
-
-          # 定义字符集 (使用最安全的数组定义方式)
-          $upper = 65..90 | ForEach-Object { [char]$_ } # A-Z
-          $lower = 97..122 | ForEach-Object { [char]$_ } # a-z
-          $number = 48..57 | ForEach-Object { [char]$_ } # 0-9
-          # 特殊字符：!#$%&*+-./:;<=>?@[]^_`{|}~
-          $special = 33,35,36,37,38,42,43,45,46,47,58,59,60,61,62,63,64,91,92,93,94,95,96,123,124,125,126 | ForEach-Object { [char]$_ }
-
-          # 合并并随机打乱生成16位密码
-          $allChars = $upper + $lower + $number + $special
-          $password = -join ($allChars | Get-Random -Count 16)
-
-          # 屏蔽密码防止泄露
-          Write-Host "::add-mask::$password"
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-        shell: powershell
-
-      - name: 👤 Create User Account
-        run: |
-          Write-Host "➕ 创建用户 $env:RDP_USERNAME ..." -ForegroundColor Yellow
+          # Try to install using winget
+          Write-Host "Installing Tailscale using winget..."
+          winget install --id Tailscale.Tailscale --silent --accept-package-agreements --accept-source-agreements
           
-          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-          $username = "$"
+          Write-Host "✅ Tailscale installed via winget"
+          
+          # Wait for installation to complete
+          Start-Sleep -Seconds 5
 
-          # 如果用户已存在则删除
-          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-            Remove-LocalUser -Name $username
-          }
-
-          # 创建用户并加入管理员组
-          New-LocalUser -Name $username -Password $securePass -FullName "RDP User" -Description "Auto-created RDP account" -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member $username
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
-        shell: powershell
-
-      - name: 📦 Install Tailscale
+      - name: Find Tailscale Executable
         run: |
-          Write-Host "📦 安装 Tailscale ..." -ForegroundColor Yellow
+          Write-Host "=== Finding Tailscale Executable ==="
           
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP ailscale.msi"
+          # Try multiple methods to find tailscale.exe
+          $tsExe = $null
           
+          # Method 1: Use Get-Command to find it in PATH
+          Write-Host "Method 1: Looking for tailscale in PATH..."
           try {
-            Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
-            Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait -NoNewWindow
-            Remove-Item $installerPath -Force
+            $command = Get-Command tailscale.exe -ErrorAction Stop
+            $tsExe = $command.Source
+            Write-Host "✅ Found via Get-Command: $tsExe"
           } catch {
-            Write-Error "安装失败: $_"
-            exit 1
+            Write-Host "Not found in PATH via Get-Command"
           }
-        shell: powershell
+          
+          # Method 2: Check common installation paths
+          if (-not $tsExe) {
+            Write-Host "Method 2: Checking common installation paths..."
+            $commonPaths = @(
+              "$env:ProgramFiles\Tailscale ailscale.exe",
+              "${env:ProgramFiles(x86)}\Tailscale ailscale.exe",
+              "C:\Program Files\Tailscale ailscale.exe",
+              "C:\Program Files (x86)\Tailscale ailscale.exe"
+            )
+            
+            foreach ($path in $commonPaths) {
+              if (Test-Path $path) {
+                $tsExe = $path
+                Write-Host "✅ Found at common path: $tsExe"
+                break
+              }
+            }
+          }
+          
+          # Method 3: Search in Program Files
+          if (-not $tsExe) {
+            Write-Host "Method 3: Searching in Program Files..."
+            try {
+              $found = Get-ChildItem -Path "$env:ProgramFiles" -Filter "tailscale.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($found) {
+                $tsExe = $found.FullName
+                Write-Host "✅ Found via search: $tsExe"
+              }
+            } catch {
+              Write-Host "Search in Program Files failed"
+            }
+          }
+          
+          # Method 4: Search in Program Files (x86)
+          if (-not $tsExe) {
+            Write-Host "Method 4: Searching in Program Files (x86)..."
+            try {
+              $found = Get-ChildItem -Path "${env:ProgramFiles(x86)}" -Filter "tailscale.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($found) {
+                $tsExe = $found.FullName
+                Write-Host "✅ Found via search: $tsExe"
+              }
+            } catch {
+              Write-Host "Search in Program Files (x86) failed"
+            }
+          }
+          
+          # Method 5: Try to run tailscale.exe directly
+          if (-not $tsExe) {
+            Write-Host "Method 5: Trying to run tailscale.exe directly..."
+            try {
+              $output = & tailscale.exe version 2>&1
+              if ($LASTEXITCODE -eq 0) {
+                $tsExe = "tailscale.exe"
+                Write-Host "✅ tailscale.exe is in PATH and works"
+              }
+            } catch {
+              Write-Host "tailscale.exe not in PATH or doesn't work"
+            }
+          }
+          
+          if ($tsExe) {
+            # Test the executable
+            Write-Host "Testing Tailscale executable..."
+            try {
+              $version = & $tsExe version 2>&1
+              Write-Host "Tailscale version: $version"
+              echo "TAILSCALE_EXE=$tsExe" >> $env:GITHUB_ENV
+              Write-Host "✅ Using Tailscale executable: $tsExe"
+            } catch {
+              Write-Host "❌ Tailscale executable test failed"
+              $tsExe = $null
+            }
+          }
+          
+          if (-not $tsExe) {
+            Write-Host "⚠️ Could not find tailscale.exe, will try to install via MSI as fallback"
+            
+            # Fallback to MSI installation
+            $installerPath = "$env:TEMP ailscale.msi"
+            Write-Host "Downloading Tailscale MSI..."
+            Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $installerPath
+            
+            Write-Host "Installing with MSI..."
+            msiexec /i "$installerPath" /quiet /qn /norestart
+            
+            Start-Sleep -Seconds 10
+            Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+            
+            # Check if it's now in the default location
+            if (Test-Path "$env:ProgramFiles\Tailscale ailscale.exe") {
+              $tsExe = "$env:ProgramFiles\Tailscale ailscale.exe"
+              echo "TAILSCALE_EXE=$tsExe" >> $env:GITHUB_ENV
+              Write-Host "✅ Tailscale installed via MSI at: $tsExe"
+            } else {
+              Write-Host "❌ Failed to install Tailscale"
+              exit 1
+            }
+          }
 
-      - name: 🌐 Connect to Tailscale
+      - name: Connect to Tailscale
         run: |
-          Write-Host "🔗 连接 Tailscale 网络..." -ForegroundColor Yellow
+          Write-Host "=== Connecting to Tailscale ==="
           
-          # 修复路径拼接：使用 Combine 避免路径错误
-          $tailscaleExe = [System.IO.Path]::Combine($env:ProgramFiles, "Tailscale", "tailscale.exe")
+          $tsExe = $env:TAILSCALE_EXE
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
           
-          # 检查文件是否存在
-          if (-not (Test-Path $tailscaleExe)) {
-            Write-Error "❌ 未找到 Tailscale 客户端，请检查安装步骤。"
+          Write-Host "Using: $tsExe"
+          Write-Host "Hostname: $hostname"
+          
+          # Start Tailscale service
+          Write-Host "Starting Tailscale service..."
+          try {
+            Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+          } catch {
+            Write-Host "Service not found or can't start, trying to install daemon..."
+            & $tsExe install-system-daemon 2>$null
+          }
+          
+          Start-Sleep -Seconds 5
+          
+          # Connect to Tailscale
+          $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          if ([string]::IsNullOrEmpty($authKey)) {
+            Write-Error "TAILSCALE_AUTH_KEY not set!"
             exit 1
           }
-
-          # 连接节点
-          & $tailscaleExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-${{ github.run_id }}
           
-          # 获取 IP 地址
-          $ip = & $tailscaleExe ip -4 2>$null
-          if (-not $ip) {
-            Write-Error "❌ 无法获取 Tailscale IP"
-            exit 1
+          Write-Host "Connecting with auth key..."
+          & $tsExe up --authkey=$authKey --hostname=$hostname 2>&1
+          
+          # Get IP address
+          $tsIP = $null
+          $retries = 0
+          
+          Write-Host "Getting Tailscale IP..."
+          while (-not $tsIP -and $retries -lt 10) {
+            $tsIP = & $tsExe ip -4 2>$null
+            
+            if (-not $tsIP) {
+              Write-Host "Attempt $($retries + 1)/10: No IP yet..."
+              Start-Sleep -Seconds 3
+              $retries++
+            }
+          }
+          
+          if ($tsIP) {
+            echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+            Write-Host "✅ Tailscale IP: $tsIP"
+            Write-Host "Status:"
+            & $tsExe status 2>&1
+          } else {
+            Write-Host "⚠️ Could not get Tailscale IP"
+            # Try to extract IP from status output
+            $status = & $tsExe status 2>&1
+            Write-Host "Status output: $status"
+          # Also output to job summary for easy copy-paste
+          Write-Output "## Connection Details" >> $GITHUB_STEP_SUMMARY
+          if ($env:TAILSCALE_IP) {
+            Write-Output "**IP Address:** $env:TAILSCALE_IP" >> $GITHUB_STEP_SUMMARY
+          }
+          Write-Output "**Username:** $env:RDP_USERNAME" >> $GITHUB_STEP_SUMMARY
+          Write-Output "" >> $GITHUB_STEP_SUMMARY
+          if ($env:TAILSCALE_IP) {
+            Write-Output "```" >> $GITHUB_STEP_SUMMARY
+            Write-Output "mstsc /v:$env:TAILSCALE_IP" >> $GITHUB_STEP_SUMMARY
+            Write-Output "```" >> $GITHUB_STEP_SUMMARY
           }
 
-          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-          Write-Host "✅ Tailscale 连接成功，IP: $ip" -ForegroundColor Green
-        shell: powershell
-
-      - name: 🖥️ Connection Info & Keep Alive
+      - name: Keep Alive
         run: |
-          Write-Host "====================================" -ForegroundColor Green
-          Write-Host "🎉 准备就绪! 请使用以下信息连接" -ForegroundColor Green
-          Write-Host "地址: $env:TAILSCALE_IP"
-          Write-Host "用户名: $env:RDP_USERNAME"
-          Write-Host "密码: $env:RDP_PASSWORD" # 会被掩码
-          Write-Host "====================================" -ForegroundColor Green
-
-          # 保持运行
+          Write-Host "🔄 Runner active. Click 'Cancel workflow' in GitHub to stop."
+          Write-Host ""
+          
+          if ($env:TAILSCALE_IP) {
+            Write-Host "IP: $env:TAILSCALE_IP"
+          }
+          Write-Host "User: $env:RDP_USERNAME"
+          Write-Host ""
+          
+          # Keep running
+          $minutes = 0
           while ($true) {
-            Write-Host "[$(Get-Date)] ⏳ 会话保持运行中... (在 GitHub 上点击 'Cancel' 以结束会话)"
+            $minutes++
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Active - $minutes minutes"
+            
+            # Check Tailscale every 5 minutes
+            if ($minutes % 5 -eq 0 -and $env:TAILSCALE_IP) {
+              Write-Host "Checking Tailscale..."
+              try {
+                & $env:TAILSCALE_EXE status 2>&1 | Out-Null
+                Write-Host "Tailscale OK"
+              } catch {
+                Write-Host "Tailscale issue, reconnecting..."
+                & $env:TAILSCALE_EXE up --reset 2>&1
+              }
+            }
+            
+            Start-Sleep -Seconds 60
+          }
